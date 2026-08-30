@@ -1,0 +1,4230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#5b2be0">
+<title>Potion Fusion</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#6a35e8; overflow:hidden;
+               -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+  canvas { display:block; touch-action:none; }
+</style>
+<meta name="description" content="Mix potions, fill the orders, grow your aquarium. A colour puzzle where fusing colours is the mechanic, not the mistake.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Potion Fusion">
+<meta name="mobile-web-app-capable" content="yes">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Potion Fusion: Color Merge">
+<meta property="og:description" content="Every colour-sorting game says don't mix. This one says MIX. Play free in your browser.">
+<meta property="og:image" content="share.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Potion Fusion: Color Merge">
+<meta name="twitter:description" content="Every colour-sorting game says don't mix. This one says MIX. Play free in your browser.">
+<meta name="twitter:image" content="share.png">
+<script>
+if ('serviceWorker' in navigator) {
+  addEventListener('load', function () {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  });
+}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="font.js"></script>
+<script src="core.js"></script>
+<script src="levels.js"></script>
+<script src="fish.js"></script>
+<script src="pixi.min.js"></script>
+<script src="aquarium2.js"></script>
+<script src="config.js"></script>
+<script src="analytics.js"></script>
+<script src="auth.js"></script>
+<script src="liveops.js"></script>
+<script>
+'use strict';
+/* ================= Potion Fusion — presentation layer ================= */
+if (typeof PF_PACK !== 'undefined') PF.usePack(PF_PACK);
+
+const CV = document.getElementById('c');
+const CX = CV.getContext('2d');
+
+const PAL      = { R:'#ff3b5f', Y:'#ffd93d', B:'#3fa9ff', O:'#ff9f2e', G:'#3ddc84', P:'#c976ff', T:'#14d0c4', M:'#ff4fd8', L:'#b7e514' };
+const PAL_DARK = { R:'#b81b40', Y:'#cf9c10', B:'#1a6fc4', O:'#cf7409', G:'#17a35a', P:'#963ae8', T:'#0a8f8f', M:'#c122a4', L:'#7fa30a' };
+const GLYPH = { R:'tri', Y:'dot', B:'sq', O:'dia', G:'plus', P:'star', T:'ring', M:'heart', L:'leaf' };
+const CAP = PF.CAP;
+const GOLD = '#ffc93c', GOLD_D = '#e09a12';
+const FF = 'Baloo2,system-ui,sans-serif';
+const VERSION = (typeof PF_CONFIG !== 'undefined' && PF_CONFIG.appVersion) || '2.6';
+const PRIVACY_URL = 'https://amostal.github.io/potion-fusion-console/privacy.html';
+function fnt(w, s) { return w + ' ' + s + 'px ' + FF; }
+
+/* Economy calibration: earning stays satisfying (base 10 + perfect 10 +
+ * streak), but boosters are real purchases now — a vial costs ~5 average
+ * clears, a hint ~2.5 — matching genre booster-to-payout ratios. */
+const ECON = {
+  startCoins: 30, base: 10, perfect: 10, streakPer: 2, streakCap: 10,
+  hintCost: 25, vialCost: 50, shuffleCost: 35, vialMax: 2,   // hintCost: legacy remote-config knob, no UI since v2.7
+  pipetteCost: 40, catalystCost: 60,                         // v3.0 powerups
+  giftBase: 20, giftPer: 5, giftCap: 40,
+};
+
+/* ---------- persistence ---------- */
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('pf_' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('pf_' + k, JSON.stringify(v)); } catch (e) {} },
+};
+
+/* ---------- haptics ---------- */
+function hapt(ms) {
+  if (!hapt.on) return;
+  try {
+    if (window.Android && Android.vibrate) Android.vibrate(ms);
+    else if (navigator.vibrate) navigator.vibrate(ms);
+  } catch (e) {}
+}
+hapt.on = store.get('haptics', true);
+
+/* ---------- audio (synthesized, no assets) ---------- */
+const Aud = {
+  ctx: null, master: null, on: store.get('sound', true),
+  ensure() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return false;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.5;
+      this.master.connect(this.ctx.destination);
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    return true;
+  },
+  env(t0, dur, peak) {
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    g.connect(this.master);
+    return g;
+  },
+  tone(freq, dur, type, peak, t0, slide) {
+    if (!this.on || !this.ensure()) return;
+    t0 = t0 || this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(slide, t0 + dur);
+    o.connect(this.env(t0, dur, peak || 0.25));
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  },
+  noise(dur, peak, fc, t0) {
+    if (!this.on || !this.ensure()) return;
+    t0 = t0 || this.ctx.currentTime;
+    const n = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = fc || 900; f.Q.value = 1.2;
+    src.connect(f); f.connect(this.env(t0, dur, peak || 0.2));
+    src.start(t0);
+  },
+  glug(i) { this.tone(220 + Math.random() * 60 + i * 30, 0.09, 'sine', 0.18, null, 130); this.noise(0.05, 0.05, 1400); },
+  fuse() {
+    if (!this.on || !this.ensure()) return;
+    const t = this.ctx.currentTime;
+    this.tone(392, 0.16, 'triangle', 0.22, t, 523);
+    this.tone(494, 0.16, 'triangle', 0.22, t, 659);
+    this.tone(784, 0.25, 'sine', 0.12, t + 0.10);
+    this.noise(0.18, 0.10, 3200, t + 0.02);
+  },
+  deliver() { this.tone(660, 0.08, 'sine', 0.16, null, 880); },
+  cork() {
+    if (!this.on || !this.ensure()) return;
+    const t = this.ctx.currentTime;
+    this.noise(0.05, 0.25, 700, t);
+    this.tone(523, 0.12, 'sine', 0.2, t + 0.03, 1046);
+  },
+  win() {
+    if (!this.on || !this.ensure()) return;
+    const t = this.ctx.currentTime;
+    [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.28, 'triangle', 0.2, t + i * 0.09));
+    this.noise(0.5, 0.06, 5000, t + 0.2);
+  },
+  star(i) { this.tone(700 + i * 180, 0.18, 'triangle', 0.22, null, 900 + i * 220); },
+  coin() { this.tone(1250 + Math.random() * 180, 0.06, 'sine', 0.10, null, 1600); },
+  buy() {
+    if (!this.on || !this.ensure()) return;
+    const t = this.ctx.currentTime;
+    this.tone(520, 0.09, 'sine', 0.18, t, 700);
+    this.tone(880, 0.12, 'sine', 0.15, t + 0.07, 1100);
+  },
+  pop() { this.tone(320, 0.10, 'sine', 0.16, null, 520); this.noise(0.04, 0.06, 2000); },
+  praise(tier) {
+    if (!this.on || !this.ensure()) return;
+    const t = this.ctx.currentTime;
+    const base = [659, 784, 988][Math.min(tier, 2)];
+    this.tone(base, 0.14, 'triangle', 0.2, t);
+    this.tone(base * 1.5, 0.2, 'triangle', 0.18, t + 0.09);
+  },
+  deny() { this.tone(140, 0.12, 'square', 0.10, null, 90); },
+  click() { this.tone(700, 0.04, 'sine', 0.08); },
+};
+
+/* ---------- music (generative chill loop, no assets) ---------- */
+/* A 4-chord C-major loop (Cmaj7 → Am7 → Fmaj7 → G) scheduled ahead of the
+ * audio clock: soft detuned pads, a round sine bass and sparse pentatonic
+ * plucks, all on a separate bus so the MUSIC and SOUND toggles stay
+ * independent. Starts on the first tap (WebView autoplay rules). */
+const Mus = {
+  on: store.get('music', true),
+  playing: false, timer: null, bus: null, lp: null, nextT: 0, bar: 0,
+  BPM: 76,
+  PROG: [   // semitones from C4: bass root, pad voicing, pluck palette
+    { bass: -24, pad: [-12, -8, -5, -1], arp: [0, 4, 7, 11, 14] },
+    { bass: -27, pad: [-15, -12, -8, -5], arp: [-3, 0, 4, 7, 12] },
+    { bass: -19, pad: [-19, -15, -12, -8], arp: [-3, 0, 5, 9, 12] },
+    { bass: -17, pad: [-17, -13, -10, -5], arp: [-1, 2, 7, 11, 14] },
+  ],
+  freq(n) { return 261.626 * Math.pow(2, n / 12); },
+  ensure() {
+    if (!Aud.ensure()) return false;
+    if (!this.bus) {
+      this.bus = Aud.ctx.createGain();
+      this.bus.gain.value = 0;
+      this.lp = Aud.ctx.createBiquadFilter();
+      this.lp.type = 'lowpass'; this.lp.frequency.value = 2600; this.lp.Q.value = 0.4;
+      this.bus.connect(this.lp); this.lp.connect(Aud.ctx.destination);
+    }
+    return true;
+  },
+  note(n, t, dur, peak, type) {
+    const o = Aud.ctx.createOscillator();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(this.freq(n), t);
+    const g = Aud.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + Math.min(0.06, dur * 0.2));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.bus);
+    o.start(t); o.stop(t + dur + 0.05);
+  },
+  pad(n, t, dur) {
+    const g = Aud.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.021, t + dur * 0.35);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur * 1.06);
+    g.connect(this.bus);
+    const o1 = Aud.ctx.createOscillator();
+    o1.type = 'triangle'; o1.frequency.setValueAtTime(this.freq(n), t);
+    const o2 = Aud.ctx.createOscillator();          // shimmer an octave up
+    o2.type = 'sine'; o2.frequency.setValueAtTime(this.freq(n + 12), t);
+    o2.detune.setValueAtTime(6, t);
+    const g2 = Aud.ctx.createGain(); g2.gain.value = 0.4;
+    o1.connect(g); o2.connect(g2); g2.connect(g);
+    o1.start(t); o1.stop(t + dur * 1.1);
+    o2.start(t); o2.stop(t + dur * 1.1);
+  },
+  scheduleBar(t) {
+    const beat = 60 / this.BPM;
+    const ch = this.PROG[this.bar % this.PROG.length];
+    this.note(ch.bass, t, beat * 2.4, 0.05, 'sine');
+    if (Math.random() < 0.7) this.note(ch.bass + 12, t + beat * 2.5, beat * 1.1, 0.026, 'sine');
+    for (const n of ch.pad) this.pad(n, t, beat * 4);
+    for (let s = 0; s < 8; s++) {                   // sparse plucked 8ths
+      if (Math.random() > 0.55) continue;
+      const n = ch.arp[Math.floor(Math.random() * ch.arp.length)] + (Math.random() < 0.25 ? 12 : 0);
+      this.note(n, t + s * beat / 2, 0.42, 0.042 + Math.random() * 0.02, 'triangle');
+    }
+    if (this.bar % 2 === 1) {                       // an occasional far sparkle
+      this.note(ch.arp[2] + 24, t + beat * (1 + Math.floor(Math.random() * 2)), 1.2, 0.015, 'sine');
+    }
+  },
+  tick() {
+    if (!this.playing || !Aud.ctx) return;
+    const barDur = (60 / this.BPM) * 4;
+    // after a main-thread stall, skip the missed bars instead of cramming
+    // them all into "now" as one discordant burst
+    if (this.nextT < Aud.ctx.currentTime) this.nextT = Aud.ctx.currentTime + 0.1;
+    while (this.nextT < Aud.ctx.currentTime + 0.9) {
+      this.scheduleBar(this.nextT);
+      this.nextT += barDur;
+      this.bar++;
+    }
+  },
+  start() {
+    if (!this.on || this.playing) return;
+    // a bar or two may still be scheduled from the previous run (app switch,
+    // quick off->on): orphan the old bus so leftovers can't layer under the
+    // fresh bars, then build a clean one
+    if (this.bus) {
+      try { this.bus.disconnect(); } catch (e) {}
+      try { this.lp.disconnect(); } catch (e) {}
+      this.bus = this.lp = null;
+    }
+    if (!this.ensure()) return;
+    this.playing = true;
+    this.nextT = Aud.ctx.currentTime + 0.15;
+    this.bus.gain.cancelScheduledValues(Aud.ctx.currentTime);
+    this.bus.gain.setTargetAtTime(0.85, Aud.ctx.currentTime, 0.6);
+    this.timer = setInterval(() => this.tick(), 240);
+    this.tick();
+  },
+  stop() {
+    if (!this.playing) return;
+    this.playing = false;
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.bus && Aud.ctx) {
+      this.bus.gain.cancelScheduledValues(Aud.ctx.currentTime);
+      this.bus.gain.setTargetAtTime(0, Aud.ctx.currentTime, 0.12);
+    }
+  },
+};
+document.addEventListener('visibilitychange', () => {
+  try {
+    if (document.hidden) { Mus.stop(); if (Aud.ctx) Aud.ctx.suspend(); }
+    else if (Aud.ctx) { Aud.ctx.resume(); Mus.start(); }
+  } catch (e) {}
+});
+
+/* ---------- viewport ---------- */
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 3);
+  W = window.innerWidth; H = window.innerHeight;
+  CV.width = Math.round(W * DPR); CV.height = Math.round(H * DPR);
+  CV.style.width = W + 'px'; CV.style.height = H + 'px';
+  CX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  layout();
+}
+window.addEventListener('resize', resize);
+
+/* ---------- game state ---------- */
+const G = {
+  level: store.get('level', 1),
+  coins: store.get('coins', ECON.startCoins),
+  coinShown: 0,                       // animated counter
+  streak: store.get('streak', 0),     // consecutive 3-star clears
+  state: null, view: null,
+  solution: null, solStep: 0, deviated: false,
+  sel: -1, selT: 0,
+  undoStack: [],
+  undos: 0, restarted: false, hints: 0, vials: 0, shuffles: 0,
+  phase: 'play',                      // play | anim | win
+  lockT: 0,                           // input lock (level intro)
+  winT: 0, winData: null,
+  firstFusionSeen: store.get('fusionSeen', false),
+  slots: [], pop: [],                 // per-flask spawn time (intro bounce)
+  pulse: [],                          // per-flask squash pulse
+  hint: null, hintT: 0, idleT: 0,
+  denyF: -1, denyT: 0,
+  shake: 0, shakeT: 0, t: 0,
+  bannerT: 0, flash: 0,
+  hard: false, par: 0, gift: null, giftT: 0,
+  moves: 0, levelT0: 0,
+  account: false,
+  aquarium: false, shop: false, ad: null, fishDetail: null, newFish: null, consent: false,
+  settings: false, album: false, decorShop: false, tankDone: null, starPop: 0,
+};
+G.coinShown = G.coins;
+
+/* Level Foundry — infinite levels. The first packSize() levels come from the
+   curated pack; beyond that the SAME bot-playtesting pipeline runs on-device:
+   the next level is pre-brewed in idle frames and cached, so loads stay
+   instant. Deterministic in n — every player gets the same level N. */
+const Foundry = {
+  job: null, jobN: 0,
+  cacheGet(n) { const c = store.get('foundry', null); return c && c.n === n ? c.data : null; },
+  cachePut(n, data) { store.set('foundry', { n, data }); },
+  wantN() { const next = G.level + 1; return next > PF.packSize() ? next : 0; },
+  tick() {
+    const n = this.wantN();
+    if (!n || this.cacheGet(n)) { this.job = null; return; }
+    if (!this.job || this.jobN !== n) { this.job = PF.smith.makeJob(n, PF.smith.FAST); this.jobN = n; }
+    try {
+      if (this.job.step()) {
+        this.cachePut(n, this.job.result());
+        this.job = null;
+        PFA.track('foundry_brew', { level: n, mode: 'idle' });
+      }
+    } catch (e) { this.job = null; }
+  },
+};
+function getLevelSmart(n) {
+  try {
+    if (n <= PF.packSize()) return PF.genLevel(n);
+    const cached = Foundry.cacheGet(n);
+    if (cached) return PF.smith.inflate(cached, n);
+    const t0 = Date.now();
+    const job = PF.smith.makeJob(n, PF.smith.FAST);
+    while (!job.step()) { /* rare synchronous brew if the player outran the foundry */ }
+    const data = job.result();
+    Foundry.cachePut(n, data);
+    PFA.track('foundry_brew', { level: n, mode: 'sync', ms: Date.now() - t0 });
+    return PF.smith.inflate(data, n);
+  } catch (e) {
+    return PF.genLevel(n);
+  }
+}
+
+function loadLevel(n, quiet) {
+  const gen = getLevelSmart(n);
+  G.state = gen.state;
+  G.view = PF.cloneState(gen.state);
+  G.solution = gen.solution || [];
+  G.hard = !!gen.hard;
+  G.par = gen.par || G.solution.length;
+  G.solStep = 0; G.deviated = false;
+  G.sel = -1; G.undoStack = [];
+  G.undos = 0; G.restarted = false; G.hints = 0; G.vials = 0; G.shuffles = 0; G.powers = 0;
+  G.arm = null;
+  G.phase = 'play'; G.hint = null; G.idleT = 0; G.winData = null;
+  G.moves = 0; G.stuckHinted = false;
+  G.levelT0 = Date.now();
+  // quiet = booting behind a menu: level_start fires when play actually
+  // begins; levelStarted keeps a menu-pause resume from double-counting
+  G.levelStarted = !quiet;
+  if (!quiet) PFA.track('level_start', { level: n, hard: G.hard ? 1 : 0, par: G.par });
+  G.pop = G.state.flasks.map((f, i) => -i * 0.06);
+  G.pulse = G.state.flasks.map(() => 0);
+  G.lockT = 0.5 + G.state.flasks.length * 0.06;
+  anims.length = 0; parts.length = 0; toasts.length = 0; floats.length = 0; rings.length = 0; coinFly.length = 0;
+  G.bannerT = 1.8;
+  layout();
+  if (!quiet) levelIntroToasts(n);
+}
+
+/* ---------- layout ---------- */
+function layout() {
+  if (!G.state) return;
+  const flasks = G.view.flasks;
+  const orders = [], work = [];
+  flasks.forEach((f, i) => (f.order ? orders : work).push(i));
+  const colW = Math.min(W, 540);
+  const x0 = (W - colW) / 2;
+  const hud = 108;
+  const barH = 104; // bottom booster bar
+  const perRow = work.length <= 4 ? Math.max(2, work.length) : work.length <= 8 ? 4 : Math.ceil(work.length / 2);
+  const rows = Math.ceil(work.length / perRow) || 1;
+  const oW = Math.min(84, (colW - 40) / Math.max(orders.length, 1) - 14);
+  const oH = oW * 1.26;
+  const shelfH = oH + 64;
+  let tw = Math.min(64, (colW - 32) / perRow - 14);
+  let th = tw * 2.55;
+  const availH = H - hud - shelfH - 30 - barH - rows * 26;
+  if (rows * th > availH) { th = availH / rows; tw = Math.min(tw, th / 2.3); }
+  G.slots = new Array(flasks.length);
+  const oTotW = orders.length * (oW + 18) - 18;
+  orders.forEach((fi, k) => {
+    G.slots[fi] = { x: x0 + colW / 2 - oTotW / 2 + k * (oW + 18), y: hud + 34, w: oW, h: oH, kind: 'order' };
+  });
+  const yW0base = hud + shelfH + 10;
+  const availableH = H - yW0base - barH - 10;
+  const rowH = Math.min(availableH / rows, th + 46);
+  const yW0 = yW0base + Math.max(0, (availableH - rowH * rows) * 0.30);
+  work.forEach((fi, k) => {
+    const r = Math.floor(k / perRow);
+    const inRow = Math.min(perRow, work.length - r * perRow);
+    const totW = inRow * (tw + 16) - 16;
+    const cIdx = k - r * perRow;
+    G.slots[fi] = {
+      x: x0 + colW / 2 - totW / 2 + cIdx * (tw + 16),
+      y: yW0 + r * rowH + Math.max(0, (rowH - th) / 2) - 4,
+      w: tw, h: th, kind: 'tube',
+    };
+  });
+}
+
+/* ---------- FX pools ---------- */
+const parts = [], toasts = [], floats = [], rings = [], coinFly = [];
+function burst(x, y, colors, n, spd, up) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const v = (0.35 + Math.random() * 0.65) * spd;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - (up || 0),
+      r: 2 + Math.random() * 3.2, life: 1, decay: 1.4 + Math.random() * 1.2,
+      col: colors[i % colors.length], grav: 260 });
+  }
+}
+function confetti() {
+  for (let i = 0; i < 110; i++) {
+    parts.push({ x: Math.random() * W, y: -12 - Math.random() * H * 0.4,
+      vx: (Math.random() - 0.5) * 60, vy: 90 + Math.random() * 140,
+      r: 3 + Math.random() * 4.5, life: 1, decay: 0.20, grav: 30,
+      col: Object.values(PAL)[i % 6], sq: true, rot: Math.random() * 6, vr: (Math.random() - 0.5) * 8 });
+  }
+}
+function toast(msg, dur) { toasts.push({ msg, life: dur || 2.2, max: dur || 2.2 }); if (toasts.length > 2) toasts.shift(); }
+function floatText(x, y, text, col, size) {
+  floats.push({ x, y, text, col: col || '#fff', size: size || 17, life: 1, vy: -46 });
+}
+function ring(x, y, col) { rings.push({ x, y, r: 6, life: 1, col }); }
+function shakeIt(p) { G.shake = Math.max(G.shake, p); G.shakeT = 0; }
+function flyCoins(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    coinFly.push({ x, y, sx: x + (Math.random() - 0.5) * 70, sy: y + (Math.random() - 0.5) * 40,
+      t: -i * 0.06, dur: 0.55 + Math.random() * 0.2 });
+  }
+}
+
+/* ---------- animation queue ---------- */
+const anims = [];
+function startPour(from, to, info, postState, completedOrder) {
+  G.phase = 'anim';
+  const perUnit = info.kind === 'fusion' ? 0.20 : 0.13;
+  anims.push({ type: 'pour', from, to, info, postState, completedOrder,
+    t: 0, lift: 0.16, unitI: 0, perUnit, total: 0.16 + info.count * perUnit + 0.16 });
+}
+
+function stepAnims(dt) {
+  if (!anims.length) return;
+  const a = anims[0];
+  a.t += dt;
+  if (a.type !== 'pour') return;
+  const tIn = a.t - a.lift;
+  while (a.unitI < a.info.count && tIn > a.unitI * a.perUnit) {
+    const s = G.view.flasks[a.from], d = G.view.flasks[a.to];
+    const sl = G.slots[a.to];
+    if (a.info.kind === 'transfer') {
+      d.units.push(s.units.pop());
+      G.pulse[a.to] = 1;
+      Aud.glug(a.unitI);
+      if (d.order) { Aud.deliver(); hapt(12); }
+    } else {
+      s.units.pop();
+      let idx = d.units.length - 1;
+      for (let q = d.units.length - 1; q >= 0; q--) { if (d.units[q] === a.info.other) { idx = q; break; } }
+      d.units[idx] = a.info.mixColor;
+      const uy = liquidY(sl, idx);
+      burst(sl.x + sl.w / 2, uy, [PAL[a.info.color], PAL[a.info.other], PAL[a.info.mixColor], '#ffffff'], 30, 170, 60);
+      ring(sl.x + sl.w / 2, uy, PAL[a.info.mixColor]);
+      G.pulse[a.to] = 1;
+      shakeIt(4.5);
+      G.flash = Math.max(G.flash, 0.5);
+      Aud.fuse(); hapt(30);
+      if (a.unitI === 0) floatText(sl.x + sl.w / 2, uy - 26, PF.NAMES[a.info.mixColor] + '!', PAL[a.info.mixColor], 19);
+      store.set('fusions', (store.get('fusions', 0)) + 1);
+      if (!G.firstFusionSeen) {
+        G.firstFusionSeen = true; store.set('fusionSeen', true);
+        toast('FUSION! Two potions became ' + PF.NAMES[a.info.mixColor] + '!', 2.8);
+      }
+    }
+    a.unitI++;
+  }
+  if (a.t >= a.total) {
+    anims.shift();
+    G.view = PF.cloneState(a.postState);
+    if (a.info.kind === 'fusion' && a.info.count >= 2) {
+      const tier = Math.min(a.info.count - 2, 2);
+      const words = ['GREAT!', 'AMAZING!', 'INCREDIBLE!'];
+      floats.push({ x: W / 2, y: H * 0.40, text: words[tier], col: [PAL.Y, PAL.O, PAL.P][tier],
+                    size: 30 + tier * 5, life: 1.15, vy: -22, big: true });
+      Aud.praise(tier);
+    }
+    if (a.completedOrder) {
+      const sl = G.slots[a.to];
+      burst(sl.x + sl.w / 2, sl.y + 8, ['#ffffff', PAL[a.postState.flasks[a.to].order]], 34, 200, 130);
+      floatText(sl.x + sl.w / 2, sl.y - 12, 'DELIVERED!', '#fff', 16);
+      const flakes = G.hard ? 2 : 1;
+      AQ.food += flakes; saveAq();
+      floatText(sl.x + sl.w / 2, sl.y - 40, '+' + flakes + ' FISH FOOD', '#5ee7d4', 14);
+      PRESS['aquarium'] = 1;
+      Aud.cork(); hapt(45); shakeIt(3);
+    }
+    if (!anims.length) {
+      if (PF.isWon(G.state)) beginWin();
+      else { G.phase = 'play'; checkDead(); }
+    }
+  }
+}
+
+function checkDead() {
+  if (!PF.materialOk(G.state)) { toast('Not enough potion left — UNDO or RESTART', 3.0); Aud.deny(); return; }
+  if (!PF.legalMoves(G.state).length) { toast('No moves left — UNDO or RESTART', 3.0); Aud.deny(); }
+}
+
+/* ---------- economy ---------- */
+function stars3() {
+  const boosted = G.vials || G.shuffles || G.powers;
+  if (!G.undos && !G.restarted && !boosted) return 3;
+  if (!G.restarted && !boosted) return 2;
+  return 1;
+}
+function beginWin() {
+  G.phase = 'win'; G.winT = 0;
+  const stars = stars3();
+  if (stars === 3) G.streak++; else G.streak = 0;
+  store.set('streak', G.streak);
+  const lines = [['Level clear', ECON.base]];
+  if (stars === 3) lines.push(['Perfect', ECON.perfect]);
+  if (G.streak >= 2) lines.push(['Streak ×' + G.streak, Math.min(ECON.streakPer * G.streak, ECON.streakCap)]);
+  if (G.hard) lines.push(['HARD level ×2', lines.reduce((s, l) => s + l[1], 0)]);
+  const total = lines.reduce((s, l) => s + l[1], 0);
+  G.winData = { stars, lines, total, granted: false, starsShown: 0,
+    offerX2: adsLeftToday() > 0 && PFRC.flag('x2_enabled', true) };
+  PFA.track('level_complete', {
+    level: G.level, hard: G.hard ? 1 : 0, stars, moves: G.moves, par: G.par,
+    duration_s: Math.max(0, Math.round((Date.now() - G.levelT0) / 1000)),
+    undos: G.undos, hints: G.hints, vials: G.vials, shuffles: G.shuffles, powers: G.powers,
+    balance: G.coins,
+  });
+  PFA.flush();
+  if ((G.level === 1 || G.level % 5 === 0) && AQ.fish.length < 16) {
+    const nf = newFish('level');
+    AQ.fish.push(nf); saveAq();
+    G.winData.newFish = nf;
+    PFA.track('fish_granted', { level: G.level, species: PFFish.speciesName(nf),
+      rarity: PFFish.RARITY[PFFish.SPECIES[nf.sp].rarity].name, source: 'level', first: nf.fresh ? 1 : 0 });
+  }
+  confetti(); Aud.win(); hapt(70);
+  store.set('level', G.level + 1);
+  if (G.level >= store.get('best', 1)) store.set('best', G.level + 1);
+}
+function spendCoins(n) {
+  if (G.coins < n) return false;
+  G.coins -= n; store.set('coins', G.coins);
+  G.pillPulse = 1;
+  return true;
+}
+
+/* ---------- interactions ---------- */
+function flaskAt(x, y) {
+  for (let i = 0; i < G.slots.length; i++) {
+    const s = G.slots[i];
+    if (!s) continue;
+    const pad = 16;
+    if (x >= s.x - pad && x <= s.x + s.w + pad && y >= s.y - 30 && y <= s.y + s.h + pad) return i;
+  }
+  return -1;
+}
+
+function tapFlask(i) {
+  const st = G.state;
+  const f = st.flasks[i];
+  if (G.arm) { usePower(i); return; }
+  if (G.sel === -1) {
+    if (f.order) { toast(PF.NAMES[f.order] + ' order — pour ' + PF.NAMES[f.order] + ' in', 1.8); Aud.click(); return; }
+    if (!f.units.length) { Aud.click(); return; }
+    G.sel = i; G.selT = 0; Aud.click(); hapt(8);
+    return;
+  }
+  if (G.sel === i) { G.sel = -1; Aud.click(); return; }
+  const res = PF.applyMove(st, G.sel, i);
+  if (!res) {
+    const info = PF.moveInfo(st, G.sel, i);
+    if (info.reason === 'order-color') toast('Only ' + PF.NAMES[info.want] + ' fits this order', 2.0);
+    else if (info.reason === 'no-mix') toast(PF.NAMES[info.got] + ' + ' + PF.NAMES[info.top] + " don't mix", 2.0);
+    else if (info.reason === 'full') toast('That flask is full', 1.6);
+    else if (info.reason === 'order-done') toast('Order complete!', 1.4);
+    Aud.deny(); hapt(18);
+    G.denyF = i; G.denyT = 0.35;
+    G.sel = -1;
+    return;
+  }
+  const expected = !G.deviated && G.solution[G.solStep];
+  if (expected && expected[0] === G.sel && expected[1] === i) G.solStep++;
+  else G.deviated = true;
+  G.undoStack.push(PF.cloneState(st));
+  G.moves++;
+  const from = G.sel;
+  G.sel = -1; G.hint = null; G.idleT = 0;
+  G.state = res.state;
+  startPour(from, i, res.info, res.state, res.completedOrder);
+}
+
+function doUndo() {
+  if (G.phase !== 'play' || !G.undoStack.length) { Aud.deny(); return; }
+  G.state = G.undoStack.pop();
+  G.view = PF.cloneState(G.state);
+  // a bought vial stays through undo (older snapshots may lack it)
+  while (G.pop.length > G.view.flasks.length) { G.pop.pop(); G.pulse.pop(); }
+  while (G.pop.length < G.view.flasks.length) { G.pop.push(1); G.pulse.push(0); }
+  layout();
+  G.sel = -1; G.undos++; G.deviated = true; G.hint = null;
+  Aud.click(); hapt(10);
+}
+function doRestart() {
+  if (G.phase === 'anim') return;
+  PFA.track('level_restart', { level: G.level, moves: G.moves });
+  const lvl = G.level;
+  loadLevel(lvl);
+  G.restarted = true;
+  Aud.click(); hapt(10);
+}
+/* ---------- powerups: arm, then tap a flask ---------- */
+const POWERS = {
+  pipette:  { name: 'PIPETTE',  cost: () => ECON.pipetteCost,
+              prompt: 'Tap a flask to draw off its top drop' },
+  catalyst: { name: 'CATALYST', cost: () => ECON.catalystCost,
+              prompt: 'Tap a fused drop to split it back apart' },
+};
+function armPower(kind) {
+  if (G.phase !== 'play') return;
+  if (G.arm === kind) { G.arm = null; Aud.click(); return; }
+  const targets = PF.powerTargets(G.state, kind);
+  if (!targets.length) {
+    toast(kind === 'catalyst' ? 'Nothing fused to split right now' : 'Nothing to draw off yet', 2.0);
+    Aud.deny(); return;
+  }
+  if (G.coins < POWERS[kind].cost()) { noCoins(); return; }
+  G.arm = kind; G.sel = -1; G.hint = null; G.idleT = 0;
+  toasts.length = 0;              // the prompt strip says it; no double message
+  Aud.click(); hapt(8);
+}
+function usePower(i) {
+  const kind = G.arm;
+  const P = POWERS[kind];
+  if (!P) return;
+  const res = kind === 'catalyst' ? PF.applyCatalyst(G.state, i) : PF.applyPipette(G.state, i);
+  if (!res) {
+    const info = kind === 'catalyst' ? PF.catalystInfo(G.state, i) : PF.pipetteInfo(G.state, i);
+    toast(info.reason === 'primary' ? PF.NAMES[info.got] + ' is already pure — nothing to split'
+      : info.reason === 'full' ? 'No room to split into — pour one off first'
+      : info.reason === 'order-oneway' ? 'Order flasks are sealed'
+      : 'Nothing there to draw off', 2.2);
+    Aud.deny(); hapt(18);
+    G.denyF = i; G.denyT = 0.35;
+    return;
+  }
+  if (!spendCoins(P.cost())) { noCoins(); G.arm = null; return; }
+  coinSpendFx(P.cost());
+  G.undoStack.push(PF.cloneState(G.state));
+  G.state = res.state;
+  G.view = PF.cloneState(res.state);
+  G.powers++; G.arm = null; G.deviated = true; G.hint = null; G.idleT = 0;
+  G.pulse[i] = 1;
+  PFA.track('power_used', { power: kind, cost: P.cost(), level: G.level,
+    color: res.info.color, balance: G.coins });
+  const sl = G.slots[i];
+  if (sl) {
+    const cx = sl.x + sl.w / 2, cy = sl.y + sl.h / 2;
+    if (kind === 'catalyst') {
+      burst(cx, cy, [PAL[res.info.into[0]], PAL[res.info.into[1]], '#ffffff'], 22, 150, 40);
+      floatText(cx, sl.y - 6, 'SPLIT!', PAL[res.info.color], 17);
+    } else {
+      burst(cx, cy, [PAL[res.info.color] || '#ffffff', '#ffffff'], 14, 120, 60);
+      floatText(cx, sl.y - 6, 'SIPHON', '#9fd4ff', 16);
+    }
+  }
+  G.flash = Math.max(G.flash, 0.4);
+  Aud.pop(); hapt(22);
+  if (PF.isWon(G.state)) beginWin();
+}
+function doVial() {
+  if (G.phase !== 'play') return;
+  if (G.vials >= ECON.vialMax) { toast('Vial limit reached for this level', 1.8); Aud.deny(); return; }
+  if (!spendCoins(ECON.vialCost)) { noCoins(); return; }
+  coinSpendFx(ECON.vialCost);
+  G.vials++;
+  PFA.track('booster_spend', { booster: 'vial', cost: ECON.vialCost, level: G.level, balance: G.coins });
+  G.state.flasks.push(PF.flask([], null));
+  G.view.flasks.push(PF.flask([], null));
+  G.undoStack.forEach(s => s.flasks.push(PF.flask([], null)));
+  G.pop.push(0); G.pulse.push(0);
+  G.sel = -1; G.hint = null;
+  layout();
+  const sl = G.slots[G.slots.length - 1];
+  if (sl) burst(sl.x + sl.w / 2, sl.y + sl.h / 2, ['#ffffff', '#9fd4ff'], 18, 140, 40);
+  Aud.pop(); hapt(20);
+}
+function doShuffle() {
+  if (G.phase !== 'play') return;
+  if (G.coins < ECON.shuffleCost) { noCoins(); return; }
+  const work = [];
+  G.state.flasks.forEach((f, i) => { if (!f.order) work.push(i); });
+  const units = [];
+  for (const i of work) units.push.apply(units, G.state.flasks[i].units);
+  let found = null;
+  for (let attempt = 0; attempt < 14 && !found; attempt++) {
+    const cand = PF.cloneState(G.state);
+    const bag = units.slice();
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = bag[i]; bag[i] = bag[j]; bag[j] = t;
+    }
+    for (const i of work) cand.flasks[i].units = [];
+    let wi = Math.floor(Math.random() * work.length);
+    for (const u of bag) {
+      let guard = 0;
+      while (cand.flasks[work[wi % work.length]].units.length >= 4 && guard++ <= work.length) wi++;
+      cand.flasks[work[wi % work.length]].units.push(u);
+      wi++;
+    }
+    if (PF.stateKey(cand) === PF.stateKey(G.state)) continue;
+    if (PF.materialOk(cand) && PF.solve(cand, { maxNodes: 30000, maxDepth: 56 })) found = cand;
+  }
+  if (!found) { toast('No luck — try UNDO instead', 2.0); Aud.deny(); return; }
+  spendCoins(ECON.shuffleCost);
+  coinSpendFx(ECON.shuffleCost);
+  G.shuffles++;
+  PFA.track('booster_spend', { booster: 'shuffle', cost: ECON.shuffleCost, level: G.level, balance: G.coins });
+  G.undoStack.push(PF.cloneState(G.state));
+  G.state = found;
+  G.view = PF.cloneState(found);
+  G.sel = -1; G.hint = null;
+  for (let i = 0; i < G.pulse.length; i++) G.pulse[i] = 1;
+  G.flash = Math.max(G.flash, 0.5);
+  for (const i of work) {
+    const sl = G.slots[i];
+    if (sl) burst(sl.x + sl.w / 2, sl.y + sl.h / 2, ['#ffffff', '#54d9e8'], 6, 130, 40);
+  }
+  Aud.buy(); hapt(25);
+}
+function noCoins() {
+  toast('Not enough coins — earn some in the shop!', 2.2);
+  Aud.deny(); hapt(18);
+  G.coinDeny = 0.4;
+  G.shop = true;
+  PFA.track('shop_open', { source: 'no_coins' });
+}
+function coinSpendFx(n) {
+  const p = coinPillPos();
+  floatText(p.x + p.w / 2, p.y + 34, '-' + n, '#ff8091', 15);
+}
+function toggleSound() { Aud.on = !Aud.on; store.set('sound', Aud.on); if (Aud.on) { Aud.ensure(); Aud.click(); } PFA.track('settings_change', { key: 'sound', on: Aud.on ? 1 : 0 }); }
+function toggleMusic() {
+  Mus.on = !Mus.on; store.set('music', Mus.on);
+  if (Mus.on) Mus.start(); else Mus.stop();
+  Aud.click();
+  PFA.track('settings_change', { key: 'music', on: Mus.on ? 1 : 0 });
+}
+function toggleHaptics() {
+  hapt.on = !hapt.on; store.set('haptics', hapt.on);
+  Aud.click(); if (hapt.on) hapt(20);
+  PFA.track('settings_change', { key: 'haptics', on: hapt.on ? 1 : 0 });
+}
+
+/* ---------- HUD geometry ---------- */
+function colX0() { return (W - Math.min(W, 540)) / 2; }
+function coinPillPos() { const cw = 148; return { x: colX0() + Math.min(W, 540) - cw - 14, y: 14, w: cw, h: 44 }; }
+let BTNS = [];
+const PRESS = {};
+function computeButtons() {
+  // Genre-standard placement (Water Sort / Royal Match / Fishdom):
+  // - boosters: compact icon squares in the bottom thumb-zone tray
+  // - shop: the coin pill itself (green "+" cap), top right
+  // - aquarium: square meta-feature tile pinned bottom-RIGHT with a badge
+  const cp = coinPillPos();
+  const colW = Math.min(W, 540), x0 = colX0();
+  const ts = 62;
+  const tileX = x0 + colW - 14 - ts, tileY = H - 83;
+  // Touch targets are held at TAP_MIN (44px) or better everywhere: below that,
+  // thumbs start hitting the neighbour instead.
+  const TAP_MIN = 44;
+  // top-right circle row, laid out from the right edge so adding the profile
+  // button cannot shove the gear off-screen
+  const cr = TAP_MIN / 2, cgap = 10, cy = 84;
+  const circles = (PFAuth.available() ? ['profile', 'restart', 'settings'] : ['restart', 'settings']);
+  const circleX = {};
+  circles.slice().reverse().forEach((id, k) => {
+    circleX[id] = x0 + colW - 14 - cr - k * (cr * 2 + cgap);
+  });
+  // tray: UNDO (free, most-used — thumb zone) + two powerups + two boosters
+  // (the HINT button retired in v2.7 — idle glow guidance replaced it)
+  const inset = 12, gap = 8;
+  const avail = tileX - inset - (x0 + inset);
+  const bs = Math.max(TAP_MIN, Math.min(58, (avail - gap * 4) / 5));
+  const by = tileY + ts - bs;                   // bottoms align with the tile
+  const tx = (x0 + inset + tileX - inset) / 2 - (bs * 5 + gap * 4) / 2;
+  BTNS = [
+    { id: 'shop',     shape: 'r', x: cp.x, y: cp.y, w: cp.w, h: cp.h },
+    { id: 'aquarium', shape: 'r', x: tileX, y: tileY, w: ts, h: ts },
+    ...(PFAuth.available() ? [{ id: 'profile', shape: 'c', x: circleX.profile, y: cy, r: cr }] : []),
+    { id: 'settings', shape: 'c', x: circleX.settings, y: cy, r: cr },
+    { id: 'restart', shape: 'c', x: circleX.restart,  y: cy, r: cr },
+    { id: 'undo',     shape: 'r', x: tx,                    y: by, w: bs, h: bs },
+    { id: 'pipette',  shape: 'r', x: tx + bs + gap,         y: by, w: bs, h: bs, cost: ECON.pipetteCost },
+    { id: 'catalyst', shape: 'r', x: tx + (bs + gap) * 2,   y: by, w: bs, h: bs, cost: ECON.catalystCost },
+    { id: 'vial',     shape: 'r', x: tx + (bs + gap) * 3,   y: by, w: bs, h: bs, cost: ECON.vialCost },
+    { id: 'shuffle',  shape: 'r', x: tx + (bs + gap) * 4,   y: by, w: bs, h: bs, cost: ECON.shuffleCost },
+  ];
+}
+function hitButton(x, y) {
+  for (const b of BTNS) {
+    if (b.shape === 'c') { if ((x - b.x) ** 2 + (y - b.y) ** 2 <= (b.r + 7) ** 2) return b; }
+    else if (x >= b.x - 4 && x <= b.x + b.w + 4 && y >= b.y - 4 && y <= b.y + b.h + 4) return b;
+  }
+  return null;
+}
+
+function tapAt(x, y) {
+  G.idleT = 0;
+  Aud.ensure();
+  Mus.start();
+  if (G.consent) {
+    for (const b of (G._consentBtns || [])) {
+      if (hitRect(b, x, y)) {
+        const yes = b.id === 'yes';
+        PFA.setConsent(yes ? 1 : 0);
+        G.consent = false;
+        if (yes) {
+          PFA.track('consent_choice', { granted: 1 });
+          PFA.track('session_start', {
+            level: G.level, balance: G.coins, streak: G.streak,
+            signed_in: PFAuth.signedIn() ? 1 : 0, late_consent: 1,
+          });
+          // the boot-time level_start was (correctly) dropped pre-consent;
+          // re-emit it so the level funnel stays consistent — but only when
+          // a level is actually underway (on the menu it fires at PLAY)
+          if (G.phase === 'play' || G.phase === 'anim' || G.phase === 'win') {
+            G.levelStarted = true;
+            PFA.track('level_start', { level: G.level, hard: G.hard ? 1 : 0, par: G.par });
+          }
+        }
+        Aud.click(); hapt(10);
+        return;
+      }
+    }
+    return;   // modal: swallow everything else
+  }
+  if (G.ad) { adTap(x, y); return; }
+  if (G.settings) { settingsTap(x, y); return; }
+  if (G.tankDone) { tankAdvance(); return; }
+  if (G.fishDetail) { aquariumTap(x, y); return; }
+  if (G.decorShop) { decorTap(x, y); return; }
+  if (G.album) { albumTap(x, y); return; }
+  if (G.aquarium) { aquariumTap(x, y); return; }
+  if (G.shop) { shopTap(x, y); return; }
+  if (G.phase === 'signin') {
+    for (const b of (G._signBtns || [])) {
+      if (hitRect(b, x, y)) {
+        if (b.id === 'guest') {
+          PFAuth.chooseGuest();
+          enterAfterGate();
+          Aud.buy(); hapt(15);
+        } else startProvider(b.id);
+        return;
+      }
+    }
+    return;
+  }
+  if (G.account) {
+    const A2 = G._accBtns;
+    if (A2) {
+      for (const b of A2.btns) {
+        if (hitRect(b, x, y)) {
+          if (b.id === 'close') { G.account = false; Aud.click(); }
+          else if (b.id === 'signout') { PFAuth.signOut(); G.account = false; }
+          else startProvider(b.id);
+          return;
+        }
+      }
+      if (!hitRect(A2.card, x, y)) { G.account = false; Aud.click(); }
+    }
+    return;
+  }
+  if (G.gift && (G.phase === 'menu' || G.phase === 'play')) { claimGift(); return; }
+  if (G.phase === 'menu') { menuTap(x, y); return; }
+  if (G.bannerT > 0.3 && G.phase === 'play') { G.bannerT = 0.3; return; }
+  if (G.lockT > 0) return;
+  if (G.phase === 'win') {
+    if (G.winT > 0.9) {
+      const xb = G._winBtns && G._winBtns.x2;
+      if (xb && G.winData && !G.winData.granted && hitRect(xb, x, y)) {
+        Aud.click(); hapt(10);
+        startAd('win_x2', () => {
+          if (G.winData && !G.winData.granted) {
+            consumeAd();
+            G.winData.lines.push(['Ad bonus ×2', G.winData.total]);
+            G.winData.total *= 2;
+            G.winData.x2 = true;
+            Aud.win(); hapt(30);
+            grantWinCoins();
+          }
+        });
+        return;
+      }
+      if (G.winData && !G.winData.granted) grantWinCoins();
+      else if (!coinFly.length) { G.level++; store.set('level', G.level); loadLevel(G.level); }
+    }
+    return;
+  }
+  const b = hitButton(x, y);
+  if (b) {
+    PRESS[b.id] = 1;
+    if (b.id === 'aquarium') {
+      if (G.phase !== 'play') return;
+      G.aquarium = true; toasts.length = 0; reapStarved(); swimInit(); AquaGL.show(); Aud.click(); hapt(8);
+      PFA.track('aquarium_open', { fish: AQ.fish.length, food: AQ.food, hungry: hungryCount() });
+      return;
+    }
+    if (b.id === 'shop') {
+      if (G.phase !== 'play') return;
+      G.shop = true; Aud.click();
+      PFA.track('shop_open', { source: 'hud' });
+      return;
+    }
+    if (b.id === 'profile') { G.account = true; Aud.click(); return; }
+    if (b.id === 'undo') doUndo();
+    else if (b.id === 'restart') doRestart();
+    else if (b.id === 'vial') doVial();
+    else if (b.id === 'pipette' || b.id === 'catalyst') armPower(b.id);
+    else if (b.id === 'shuffle') doShuffle();
+    else if (b.id === 'settings') openSettings('hud');
+    return;
+  }
+  if (G.phase !== 'play') return;
+  const i = flaskAt(x, y);
+  if (i >= 0) tapFlask(i);
+  else if (G.arm) { G.arm = null; Aud.click(); }
+  else if (G.sel !== -1) { G.sel = -1; Aud.click(); }
+}
+function claimGift() {
+  const amt = G.gift.amount;
+  try {
+    store.set('giftDay', new Date().toDateString());
+    store.set('giftStreak', G.gift.streak);
+  } catch (e) {}
+  const gstreak = G.gift.streak;
+  G.gift = null;
+  G.coins += amt; store.set('coins', G.coins);
+  PFA.track('gift_claimed', { amount: amt, streak: gstreak, balance: G.coins });
+  PFA.track('coins_earned', { amount: amt, source: 'gift', balance: G.coins });
+  flyCoins(W / 2, H * 0.5, Math.min(10, 4 + Math.floor(amt / 6)));
+  Aud.win(); hapt(40);
+}
+function grantWinCoins() {
+  G.winData.granted = true;
+  G.coins += G.winData.total;
+  store.set('coins', G.coins);
+  PFA.track('coins_earned', { level: G.level, amount: G.winData.total, source: 'level',
+    x2: G.winData.x2 ? 1 : 0, balance: G.coins });
+  if (G.winData.newFish) PRESS['aquarium'] = 1;   // the card shows the fish; tile pulses
+  flyCoins(W / 2, H * 0.47, Math.min(10, 4 + Math.floor(G.winData.total / 6)));
+}
+// Android hardware back: close the topmost overlay; return 0 to let the app
+// fall through to its double-back-to-quit behavior.
+window.__back = function () {
+  if (G.consent) return 1;   // modal: an explicit choice is required
+  if (G.ad) {
+    PFA.track('ad_abandoned', { at: Math.round(G.ad.t * 10) / 10, placement: G.ad.placement, via: 'back' });
+    G.ad = null; toast('Watch the full ad to earn the reward', 2.0);
+    return 1;
+  }
+  if (G.settings) { G.settings = false; Aud.click(); return 1; }
+  if (G.tankDone) { tankAdvance(); return 1; }
+  if (G.fishDetail) { G.fishDetail = null; Aud.click(); return 1; }
+  if (G.decorShop) { G.decorShop = false; Aud.click(); return 1; }
+  if (G.album) { G.album = false; Aud.click(); return 1; }
+  if (G.aquarium) { G.aquarium = false; AquaGL.hide(); Aud.click(); return 1; }
+  if (G.shop) { G.shop = false; Aud.click(); return 1; }
+  if (G.account) { G.account = false; Aud.click(); return 1; }
+  if (G.gift && (G.phase === 'menu' || G.phase === 'play')) { claimGift(); return 1; }
+  if (G.arm) { G.arm = null; Aud.click(); return 1; }
+  if (G.phase === 'play') { gotoMenu(); return 1; }
+  // mid-pour or on the win card: swallow the press instead of letting the
+  // same button quit-prompt a half-second after it would have opened the menu
+  if (G.phase === 'anim' || G.phase === 'win') return 1;
+  return 0;
+};
+CV.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const S = activeShelf();
+  if (S) { scrDown(S, e.clientX, e.clientY); return; }
+  tapAt(e.clientX, e.clientY);
+}, { passive: false });
+CV.addEventListener('pointermove', e => {
+  const S = ALB.drag ? ALB : DEC.drag ? DEC : null;
+  if (S) { e.preventDefault(); scrMove(S, e.clientX, e.clientY); }
+}, { passive: false });
+for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) {
+  CV.addEventListener(ev, e => {
+    const S = ALB.drag ? ALB : DEC.drag ? DEC : null;
+    if (!S) return;
+    e.preventDefault();
+    if (ev === 'pointerup') scrUp(S, e.clientX, e.clientY, S === DEC ? decorTap : albumTap);
+    else S.drag = null;
+  }, { passive: false });
+}
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+/* ---------- drawing helpers ---------- */
+function rr(x, y, w, h, r) {
+  CX.beginPath();
+  CX.moveTo(x + r, y);
+  CX.arcTo(x + w, y, x + w, y + h, r);
+  CX.arcTo(x + w, y + h, x, y + h, r);
+  CX.arcTo(x, y + h, x, y, r);
+  CX.arcTo(x, y, x + w, y, r);
+  CX.closePath();
+}
+function easeOutBack(t) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+/* candy-UI kit: outlined gradient type, chunky 2.5D capsules, rays, ribbon */
+function outlinedText(txt, x, y, size, top, bottom, outline, align) {
+  CX.save();
+  CX.font = fnt(800, size);
+  CX.textAlign = align || 'center';
+  CX.lineJoin = 'round';
+  CX.lineWidth = Math.max(3, size * 0.17);
+  CX.strokeStyle = outline || 'rgba(24,16,44,0.92)';
+  CX.strokeText(txt, x, y);
+  const g = CX.createLinearGradient(0, y - size * 0.9, 0, y + size * 0.25);
+  g.addColorStop(0, top); g.addColorStop(1, bottom || top);
+  CX.fillStyle = g;
+  CX.fillText(txt, x, y);
+  CX.restore();
+}
+function chunkyCapsule(x, y, w, h, r, top, bottom, lip, pressed) {
+  const dy = pressed ? 2.5 : 0;
+  CX.save();
+  CX.fillStyle = lip;
+  rr(x, y + 4, w, h, r); CX.fill();
+  const g = CX.createLinearGradient(0, y + dy, 0, y + dy + h);
+  g.addColorStop(0, top); g.addColorStop(1, bottom);
+  CX.fillStyle = g;
+  rr(x, y + dy, w, h - 1, r); CX.fill();
+  CX.globalAlpha = 0.20;
+  CX.fillStyle = '#ffffff';
+  rr(x + 4, y + dy + 3, w - 8, h * 0.40, Math.min(r * 0.8, h * 0.2)); CX.fill();
+  CX.restore();
+  return dy;
+}
+function drawRays(cx, cy, R, col, alpha) {
+  CX.save();
+  CX.translate(cx, cy);
+  CX.rotate(G.t * 0.4);
+  CX.fillStyle = col;
+  CX.globalAlpha = alpha;
+  for (let i = 0; i < 12; i++) {
+    CX.rotate(Math.PI / 6);
+    CX.beginPath();
+    CX.moveTo(0, 0);
+    CX.arc(0, 0, R, -0.14, 0.14);
+    CX.closePath();
+    CX.fill();
+  }
+  CX.restore();
+}
+function drawRibbon(cx, cy, w, h, txt, size) {
+  CX.save();
+  const wing = 24, drop = 8;
+  CX.fillStyle = '#a01d43';
+  for (const s of [-1, 1]) {
+    CX.beginPath();
+    const xE = cx + s * (w / 2 + wing);
+    CX.moveTo(cx + s * (w / 2 - 10), cy - h / 2 + drop);
+    CX.lineTo(xE, cy - h / 2 + drop);
+    CX.lineTo(xE - s * h * 0.34, cy + drop);
+    CX.lineTo(xE, cy + h / 2 + drop);
+    CX.lineTo(cx + s * (w / 2 - 10), cy + h / 2 + drop);
+    CX.closePath(); CX.fill();
+  }
+  const g = CX.createLinearGradient(0, cy - h / 2, 0, cy + h / 2);
+  g.addColorStop(0, '#ff5f7e'); g.addColorStop(0.5, '#e8355f'); g.addColorStop(1, '#c92a55');
+  CX.fillStyle = g;
+  rr(cx - w / 2, cy - h / 2, w, h, 13); CX.fill();
+  CX.strokeStyle = '#ffd27a'; CX.lineWidth = 2.5;
+  rr(cx - w / 2, cy - h / 2, w, h, 13); CX.stroke();
+  CX.globalAlpha = 0.18; CX.fillStyle = '#fff';
+  rr(cx - w / 2 + 5, cy - h / 2 + 4, w - 10, h * 0.4, 9); CX.fill();
+  CX.globalAlpha = 1;
+  outlinedText(txt, cx, cy + size * 0.36, size, '#ffffff', '#ffe3ea', 'rgba(96,10,38,0.95)');
+  CX.restore();
+}
+function drawCoin(x, y, r) {
+  const g = CX.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.2, x, y, r);
+  g.addColorStop(0, '#ffe793'); g.addColorStop(0.55, GOLD); g.addColorStop(1, GOLD_D);
+  CX.fillStyle = g;
+  CX.beginPath(); CX.arc(x, y, r, 0, 7); CX.fill();
+  CX.strokeStyle = 'rgba(120,70,0,0.55)';
+  CX.lineWidth = Math.max(1, r * 0.16);
+  CX.beginPath(); CX.arc(x, y, r * 0.68, 0, 7); CX.stroke();
+  CX.fillStyle = 'rgba(255,255,255,0.85)';
+  CX.beginPath(); CX.arc(x - r * 0.3, y - r * 0.35, r * 0.16, 0, 7); CX.fill();
+}
+function drawStar(cx, cy, r, fill, dim) {
+  CX.save();
+  CX.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI / 2 + i * Math.PI * 2 / 5, a2 = a + Math.PI / 5;
+    CX[i ? 'lineTo' : 'moveTo'](cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    CX.lineTo(cx + Math.cos(a2) * r * 0.45, cy + Math.sin(a2) * r * 0.45);
+  }
+  CX.closePath();
+  if (dim) { CX.fillStyle = 'rgba(120,80,170,0.22)'; CX.fill(); }
+  else {
+    CX.shadowColor = fill; CX.shadowBlur = 14;
+    CX.fillStyle = fill; CX.fill();
+    CX.shadowBlur = 0;
+    CX.strokeStyle = 'rgba(255,255,255,0.5)'; CX.lineWidth = 1.4; CX.stroke();
+  }
+  CX.restore();
+}
+
+function flaskInterior(s) {
+  const { x, y, w, h } = s;
+  CX.beginPath();
+  if (s.kind === 'tube') {
+    const r = w / 2;
+    CX.moveTo(x, y);
+    CX.lineTo(x, y + h - r);
+    CX.arc(x + r, y + h - r, r, Math.PI, 0, true);
+    CX.lineTo(x + w, y);
+  } else {
+    const neck = w * 0.34;
+    const nx = x + (w - neck) / 2;
+    const bodyY = y + h * 0.30;
+    CX.moveTo(nx, y);
+    CX.lineTo(nx, bodyY);
+    CX.lineTo(x, y + h - 7);
+    CX.quadraticCurveTo(x, y + h, x + 7, y + h);
+    CX.lineTo(x + w - 7, y + h);
+    CX.quadraticCurveTo(x + w, y + h, x + w, y + h - 7);
+    CX.lineTo(nx + neck, bodyY);
+    CX.lineTo(nx + neck, y);
+  }
+}
+function liquidY(s, unitIdx) {
+  const layerH = (s.h - 6) / CAP;
+  return s.y + s.h - 3 - layerH * (unitIdx + 0.5);
+}
+function drawGlyph(cx, cy, r, g, alpha) {
+  CX.save();
+  CX.globalAlpha = alpha;
+  CX.fillStyle = '#ffffff';
+  CX.beginPath();
+  if (g === 'dot') { CX.arc(cx, cy, r * 0.55, 0, 7); CX.fill(); }
+  else if (g === 'tri') { CX.moveTo(cx, cy - r * 0.7); CX.lineTo(cx + r * 0.66, cy + r * 0.5); CX.lineTo(cx - r * 0.66, cy + r * 0.5); CX.closePath(); CX.fill(); }
+  else if (g === 'sq') { CX.fillRect(cx - r * 0.5, cy - r * 0.5, r, r); }
+  else if (g === 'dia') { CX.moveTo(cx, cy - r * 0.7); CX.lineTo(cx + r * 0.6, cy); CX.lineTo(cx, cy + r * 0.7); CX.lineTo(cx - r * 0.6, cy); CX.closePath(); CX.fill(); }
+  else if (g === 'plus') { CX.fillRect(cx - r * 0.6, cy - r * 0.17, r * 1.2, r * 0.34); CX.fillRect(cx - r * 0.17, cy - r * 0.6, r * 0.34, r * 1.2); }
+  else if (g === 'star') {
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + i * Math.PI * 2 / 5, a2 = a + Math.PI / 5;
+      CX[i ? 'lineTo' : 'moveTo'](cx + Math.cos(a) * r * 0.75, cy + Math.sin(a) * r * 0.75);
+      CX.lineTo(cx + Math.cos(a2) * r * 0.32, cy + Math.sin(a2) * r * 0.32);
+    }
+    CX.closePath(); CX.fill();
+  } else if (g === 'ring') {
+    CX.strokeStyle = '#ffffff'; CX.lineWidth = r * 0.32;
+    CX.arc(cx, cy, r * 0.5, 0, 7); CX.stroke();
+  } else if (g === 'heart') {
+    CX.moveTo(cx, cy + r * 0.6);
+    CX.bezierCurveTo(cx - r * 0.95, cy - r * 0.15, cx - r * 0.45, cy - r * 0.75, cx, cy - r * 0.25);
+    CX.bezierCurveTo(cx + r * 0.45, cy - r * 0.75, cx + r * 0.95, cy - r * 0.15, cx, cy + r * 0.6);
+    CX.fill();
+  } else if (g === 'leaf') {
+    CX.moveTo(cx, cy - r * 0.7);
+    CX.quadraticCurveTo(cx + r * 0.75, cy - r * 0.15, cx, cy + r * 0.7);
+    CX.quadraticCurveTo(cx - r * 0.75, cy - r * 0.15, cx, cy - r * 0.7);
+    CX.fill();
+  }
+  CX.restore();
+}
+
+function drawFlask(i) {
+  const f = G.view.flasks[i];
+  const s0 = G.slots[i];
+  if (!s0) return;
+  const a = anims[0];
+  if (a && a.type === 'pour' && a.from === i) return; // drawn as the pouring flask
+  let s = s0;
+  const selected = G.sel === i && G.phase === 'play';
+  if (selected) {
+    const k = Math.min(1, G.selT / 0.18);
+    s = { ...s0, y: s0.y - 12 * easeOutBack(k) };
+  }
+  if (G.denyF === i && G.denyT > 0) s = { ...s, x: s.x + Math.sin(G.denyT * 55) * 3.2 };
+
+  // intro pop + squash pulse transform
+  const pop = Math.max(0, Math.min(1, (G.pop[i] || 1) / 0.34));
+  const scale = pop < 1 ? easeOutBack(pop) : 1;
+  const pulse = G.pulse[i] || 0;
+  const selS = selected ? 1 + 0.05 * Math.min(1, G.selT / 0.18) : 1;
+  const sx = (1 + 0.05 * pulse) * selS, sy = (1 - 0.06 * pulse) * selS;
+  CX.save();
+  const cx = s.x + s.w / 2, cyB = s.y + s.h;
+  CX.translate(cx, cyB);
+  CX.scale(scale * sx, scale * sy);
+  CX.translate(-cx, -cyB);
+  if (scale > 0.02) drawFlaskBody(f, s, selected, i);
+  CX.restore();
+  if (selected) {
+    const ax = s.x + s.w / 2, ay = s.y - 32 + Math.sin(G.t * 7) * 4;
+    CX.save();
+    CX.lineJoin = 'round';
+    CX.strokeStyle = 'rgba(96,52,0,0.85)'; CX.lineWidth = 4;
+    CX.beginPath();
+    CX.moveTo(ax - 9, ay - 10); CX.lineTo(ax + 9, ay - 10); CX.lineTo(ax, ay + 2);
+    CX.closePath(); CX.stroke();
+    const g = CX.createLinearGradient(0, ay - 10, 0, ay + 2);
+    g.addColorStop(0, '#ffe793'); g.addColorStop(1, '#ffb43d');
+    CX.fillStyle = g; CX.fill();
+    CX.restore();
+  }
+}
+
+function drawFlaskBody(f, s, selected, idx) {
+  const done = f.done;
+  // grounding shadow
+  CX.save();
+  CX.fillStyle = 'rgba(40,5,90,0.28)';
+  CX.beginPath();
+  CX.ellipse(s.x + s.w / 2, s.y + s.h + 6, s.w * 0.62, 6.5, 0, 0, 7);
+  CX.fill();
+  CX.restore();
+  if (selected || done) {
+    CX.save();
+    flaskInterior(s);
+    CX.shadowColor = done ? PAL[f.order] : '#8fd8ff';
+    CX.shadowBlur = selected ? 30 : 24;
+    CX.strokeStyle = selected ? 'rgba(255,255,255,0.40)' : 'rgba(255,255,255,0.12)';
+    CX.lineWidth = 3;
+    CX.stroke();
+    if (selected) CX.stroke();
+    CX.restore();
+  }
+  if (f.order) {
+    const col = PAL[f.order];
+    CX.save();
+    CX.strokeStyle = col;
+    CX.globalAlpha = done ? 0.95 : 0.8;
+    CX.lineWidth = 2;
+    CX.setLineDash(done ? [] : [5, 4]);
+    rr(s.x - 7, s.y - 22, s.w + 14, s.h + 34, 10);
+    CX.stroke();
+    CX.setLineDash([]);
+    CX.fillStyle = col;
+    CX.font = fnt(800, 10);
+    CX.textAlign = 'center';
+    const tag = done ? '✓ DONE' : PF.NAMES[f.order];
+    const tw = CX.measureText(tag).width + 12;
+    rr(s.x + s.w / 2 - tw / 2, s.y - 34, tw, 15, 7);
+    CX.fill();
+    CX.fillStyle = '#2a1150';
+    CX.fillText(tag, s.x + s.w / 2, s.y - 23);
+    CX.restore();
+  }
+  // liquid
+  CX.save();
+  flaskInterior(s);
+  CX.clip();
+  const layerH = (s.h - 4) / CAP;
+  for (let u = 0; u < f.units.length; u++) {
+    const c = f.units[u];
+    const ly = s.y + s.h - 2 - layerH * (u + 1);
+    const grad = CX.createLinearGradient(0, ly, 0, ly + layerH);
+    grad.addColorStop(0, PAL[c]);
+    grad.addColorStop(1, PAL_DARK[c]);
+    CX.fillStyle = grad;
+    CX.fillRect(s.x - s.w, ly, s.w * 3, layerH + 1);
+    if (u === f.units.length - 1) {
+      // animated wavy surface
+      const amp = 1.4 + (G.pulse[idx] || 0) * 3.2;
+      CX.save();
+      CX.shadowColor = PAL[c]; CX.shadowBlur = 9;
+      CX.fillStyle = 'rgba(255,255,255,0.42)';
+      CX.beginPath();
+      CX.moveTo(s.x - 3, ly + 3.2);
+      for (let wx = 0; wx <= s.w + 6; wx += 5) {
+        CX.lineTo(s.x - 3 + wx, ly + Math.sin(wx * 0.2 + G.t * 2.4 + idx * 2) * amp);
+      }
+      CX.lineTo(s.x + s.w + 3, ly + 3.2);
+      CX.closePath();
+      CX.fill();
+      CX.restore();
+    }
+    drawGlyph(s.x + s.w / 2, ly + layerH / 2, Math.min(7, layerH * 0.3), GLYPH[c], 0.26);
+  }
+  if (f.units.length && !done) {
+    for (let b = 0; b < 2; b++) {
+      const ph = (G.t * 0.5 + idx * 1.7 + b * 2.3) % 1;
+      const bx = s.x + s.w * (0.3 + 0.4 * Math.sin(idx * 3 + b * 5));
+      const byTop = s.y + s.h - 4 - layerH * f.units.length;
+      const by = s.y + s.h - 6 - (s.h - 10) * ph * (f.units.length / CAP);
+      if (by > byTop + 4) {
+        CX.fillStyle = 'rgba(255,255,255,0.20)';
+        CX.beginPath(); CX.arc(bx, by, 1.6 + b, 0, 7); CX.fill();
+      }
+    }
+  }
+  CX.restore();
+  // glass
+  flaskInterior(s);
+  CX.strokeStyle = done ? PAL[f.order] : 'rgba(255,255,255,0.92)';
+  CX.lineWidth = 3.4;
+  CX.stroke();
+  CX.fillStyle = 'rgba(255,255,255,0.09)';
+  flaskInterior(s); CX.fill();
+  CX.save();
+  flaskInterior(s); CX.clip();
+  CX.fillStyle = 'rgba(255,255,255,0.10)';
+  CX.fillRect(s.x + s.w * 0.12, s.y + 2, s.w * 0.10, s.h - 6);
+  CX.restore();
+  CX.strokeStyle = 'rgba(255,255,255,0.97)';
+  CX.lineWidth = 4;
+  CX.beginPath();
+  if (s.kind === 'tube') { CX.moveTo(s.x - 2, s.y); CX.lineTo(s.x + s.w + 2, s.y); }
+  else {
+    const neck = s.w * 0.34, nx = s.x + (s.w - neck) / 2;
+    CX.moveTo(nx - 2, s.y); CX.lineTo(nx + neck + 2, s.y);
+  }
+  CX.stroke();
+  if (done) {
+    const neck = s.kind === 'order' ? s.w * 0.34 : s.w;
+    const nx = s.x + (s.w - neck) / 2;
+    CX.fillStyle = '#c98d5a';
+    rr(nx + 1, s.y - 10, neck - 2, 12, 3);
+    CX.fill();
+    CX.fillStyle = 'rgba(0,0,0,0.18)';
+    rr(nx + 1, s.y - 4, neck - 2, 5, 2);
+    CX.fill();
+  }
+  if (f.order) {
+    CX.fillStyle = 'rgba(255,255,255,0.8)';
+    CX.font = fnt(800, 13);
+    CX.textAlign = 'center';
+    CX.fillText(f.units.length + '/4', s.x + s.w / 2, s.y + s.h + 25);
+  }
+}
+
+function drawPouring() {
+  const a = anims[0];
+  if (!a || a.type !== 'pour') return;
+  const sSrc = G.slots[a.from], sDst = G.slots[a.to];
+  const f = G.view.flasks[a.from];
+  const prog = Math.min(1, a.t / a.lift);
+  const ease = prog < 1 ? 1 - Math.pow(1 - prog, 3) : 1;
+  const retreat = a.t > a.total - 0.16 ? (a.t - (a.total - 0.16)) / 0.16 : 0;
+  const k = ease * (1 - retreat * retreat);
+  const side = sSrc.x < sDst.x ? -1 : 1;
+  const hx = sDst.x + sDst.w / 2 + side * (sDst.w * 0.72) - sSrc.w / 2;
+  const hy = sDst.y - sSrc.h * 0.72;
+  const x = sSrc.x + (hx - sSrc.x) * k;
+  const y = sSrc.y + (hy - sSrc.y) * k;
+  const ang = side * -1 * (Math.PI * 0.42) * k;
+  CX.save();
+  CX.translate(x + sSrc.w / 2, y + sSrc.h * 0.85);
+  CX.rotate(ang);
+  CX.translate(-(sSrc.w / 2), -(sSrc.h * 0.85));
+  drawFlaskBody(f, { x: 0, y: 0, w: sSrc.w, h: sSrc.h, kind: sSrc.kind }, false, a.from);
+  CX.restore();
+  const pouring = a.t > a.lift && a.t < a.total - 0.14 && a.unitI <= a.info.count;
+  if (pouring && k > 0.9) {
+    const lipY = y + sSrc.h * 0.85 - Math.cos(ang) * sSrc.h * 0.8;
+    const tx = sDst.x + sDst.w / 2;
+    const fillN = G.view.flasks[a.to].units.length;
+    const ty = a.info.kind === 'fusion' ? liquidY(sDst, Math.max(0, fillN - 1)) : sDst.y + sDst.h - 2 - ((sDst.h - 4) / CAP) * fillN;
+    CX.save();
+    CX.shadowColor = PAL[a.info.color]; CX.shadowBlur = 8;
+    CX.strokeStyle = PAL[a.info.color];
+    CX.lineWidth = 4;
+    CX.lineCap = 'round';
+    CX.globalAlpha = 0.92;
+    CX.beginPath();
+    CX.moveTo(tx + side * 6, Math.min(lipY, ty - 8));
+    CX.quadraticCurveTo(tx + side * 2, (Math.min(lipY, ty - 8) + ty) / 2, tx, ty);
+    CX.stroke();
+    CX.restore();
+    if (Math.random() < 0.5) {
+      parts.push({ x: tx + (Math.random() - 0.5) * 8, y: ty, vx: (Math.random() - 0.5) * 50, vy: -40 - Math.random() * 40, r: 1.6, life: 0.5, decay: 2.4, col: PAL[a.info.color], grav: 300 });
+    }
+  }
+}
+
+/* ---------- order shelf panel ---------- */
+function drawOrderShelf() {
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9, any = false;
+  G.view.flasks.forEach((f, i) => {
+    if (!f.order || !G.slots[i]) return;
+    const s = G.slots[i];
+    any = true;
+    x0 = Math.min(x0, s.x - 16); x1 = Math.max(x1, s.x + s.w + 16);
+    y0 = Math.min(y0, s.y - 42); y1 = Math.max(y1, s.y + s.h + 32);
+  });
+  if (!any) return;
+  CX.save();
+  CX.fillStyle = 'rgba(255,255,255,0.10)';
+  rr(x0, y0, x1 - x0, y1 - y0, 18); CX.fill();
+  CX.strokeStyle = 'rgba(255,255,255,0.35)';
+  CX.lineWidth = 2;
+  rr(x0, y0, x1 - x0, y1 - y0, 18); CX.stroke();
+  CX.restore();
+}
+
+/* ---------- level-start goal banner ---------- */
+function drawBanner(dt) {
+  if (G.bannerT <= 0 || G.phase !== 'play' || G.gift) return;
+  G.bannerT -= dt;
+  const tIn = 1.8 - G.bannerT;
+  const kIn = easeOutBack(Math.min(1, tIn / 0.32));
+  const kOut = Math.min(1, G.bannerT / 0.28);
+  const a = Math.min(kIn, kOut);
+  if (a <= 0) return;
+  CX.save();
+  CX.globalAlpha = Math.min(1, a);
+  CX.fillStyle = 'rgba(40,10,80,0.45)';
+  CX.fillRect(0, 0, W, H);
+  const cy = H * 0.36;
+  CX.translate(W / 2, cy); CX.scale(kIn, kIn); CX.translate(-W / 2, -cy);
+  drawRibbon(W / 2, cy - 44, Math.min(W - 150, 230), 46, 'LEVEL ' + G.level, 21);
+  const orders = G.state.flasks.filter(f => f.order);
+  const pw = Math.min(W - 72, 120 + orders.length * 64), ph = 92;
+  CX.fillStyle = '#fff6ea';
+  rr(W / 2 - pw / 2, cy - 6, pw, ph, 18); CX.fill();
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 2.5;
+  rr(W / 2 - pw / 2, cy - 6, pw, ph, 18); CX.stroke();
+  outlinedText('DELIVER', W / 2, cy + 18, 13, '#a06ae8', '#7b3ff2', 'rgba(0,0,0,0)');
+  if (G.hard) {
+    chunkyCapsule(W / 2 - 62, cy - 20, 124, 22, 11, '#ff5f7e', '#d81f4a', '#8f1230');
+    outlinedText('HARD LEVEL', W / 2, cy - 4, 12, '#ffffff', '#ffd9e2', 'rgba(110,8,40,0.95)');
+  }
+  const gap = 62, gx0 = W / 2 - (orders.length - 1) * gap / 2;
+  orders.forEach((o, i) => {
+    const gx = gx0 + i * gap, gy = cy + 52;
+    CX.save();
+    CX.shadowColor = PAL[o.order]; CX.shadowBlur = 12;
+    const g = CX.createLinearGradient(0, gy - 14, 0, gy + 14);
+    g.addColorStop(0, PAL[o.order]); g.addColorStop(1, PAL_DARK[o.order]);
+    CX.fillStyle = g;
+    CX.beginPath(); CX.arc(gx, gy, 15, 0, 7); CX.fill();
+    CX.restore();
+    CX.strokeStyle = 'rgba(255,255,255,0.75)'; CX.lineWidth = 2;
+    CX.beginPath(); CX.arc(gx, gy, 15, 0, 7); CX.stroke();
+    drawGlyph(gx, gy, 8, GLYPH[o.order], 0.5);
+    outlinedText('×4', gx + 23, gy + 6, 14, '#6b4090', '#53307a', 'rgba(0,0,0,0)', 'left');
+  });
+  CX.restore();
+}
+
+/* ---------- HUD ---------- */
+function drawHUD(dt) {
+  computeButtons();
+  const x0 = colX0();
+  // level pill (chunky)
+  CX.save();
+  const lp = { x: x0 + 14, y: 14, w: 132, h: 42 };
+  const lvTxt = 'LEVEL ' + G.level;
+  CX.font = fnt(800, 19);
+  const lvSize = CX.measureText(lvTxt).width > lp.w - 22 ? 15 : 19;
+  const lvY = lp.y + (lvSize === 19 ? 28 : 27);
+  if (G.hard) {
+    chunkyCapsule(lp.x, lp.y, lp.w, lp.h, 21, '#ff5f7e', '#e8355f', '#8f1230');
+    outlinedText(lvTxt, lp.x + lp.w / 2, lvY, lvSize, '#ffffff', '#ffd9e2', 'rgba(110,8,40,0.95)');
+  } else {
+    chunkyCapsule(lp.x, lp.y, lp.w, lp.h, 21, '#ffffff', '#efe8ff', '#b89ae8');
+    outlinedText(lvTxt, lp.x + lp.w / 2, lvY, lvSize, '#7b3ff2', '#5b2be0', 'rgba(0,0,0,0)');
+  }
+  // chapter progress: 8 levels per chapter, the 8th is the HARD spike
+  const chIdx = (G.level - 1) % 8;
+  for (let i = 0; i < 8; i++) {
+    const dx = lp.x + 10 + i * 15, dy = lp.y + 56;
+    if (i === 7) {
+      CX.save();
+      CX.fillStyle = i <= chIdx ? '#ff5f7e' : 'rgba(255,255,255,0.35)';
+      CX.translate(dx, dy); CX.rotate(Math.PI / 4);
+      CX.fillRect(-4, -4, 8, 8);
+      CX.restore();
+    } else {
+      CX.fillStyle = i < chIdx ? GOLD : i === chIdx ? '#ffffff' : 'rgba(255,255,255,0.35)';
+      CX.beginPath(); CX.arc(dx, dy, i === chIdx ? 5 : 3.5, 0, 7); CX.fill();
+      if (i === chIdx) {
+        CX.strokeStyle = GOLD; CX.lineWidth = 2;
+        CX.beginPath(); CX.arc(dx, dy, 7.5 + Math.sin(G.t * 5) * 1.2, 0, 7); CX.stroke();
+      }
+    }
+  }
+  if (G.streak >= 2) {
+    outlinedText('×' + G.streak + ' STREAK', lp.x + 134, lp.y + 61, 11, '#ffe36a', '#ffb42e', 'rgba(90,50,0,0.9)', 'left');
+  }
+  CX.restore();
+  // coin pill (chunky)
+  const cp = coinPillPos();
+  CX.save();
+  if (G.coinDeny > 0) { G.coinDeny -= dt; CX.translate(Math.sin(G.coinDeny * 60) * 3, 0); }
+  const pillS = 1 + (G.pillPulse || 0) * 0.10;
+  CX.translate(cp.x + cp.w / 2, cp.y + cp.h / 2);
+  CX.scale(pillS, pillS);
+  CX.translate(-(cp.x + cp.w / 2), -(cp.y + cp.h / 2));
+  chunkyCapsule(cp.x, cp.y, cp.w, cp.h, 21, '#ffffff', '#efe8ff', '#b89ae8');
+  drawCoin(cp.x + 24, cp.y + 21, 15);
+  const coinTxt = String(Math.round(G.coinShown));
+  const coinFs = coinTxt.length > 4 ? 17 : coinTxt.length > 3 ? 20 : 22;   // never collide with the + cap
+  outlinedText(coinTxt, cp.x + 46, cp.y + 29 - (22 - coinFs) * 0.35, coinFs, '#c47510', '#8a5200', 'rgba(0,0,0,0)', 'left');
+  // green "+" cap: the coin pill opens the shop (genre standard)
+  const plusX = cp.x + cp.w - 20, plusY = cp.y + cp.h / 2;
+  const plusR = 13.5 - (PRESS['shop'] || 0) * 1.5;
+  CX.fillStyle = '#1f7c31';
+  CX.beginPath(); CX.arc(plusX, plusY + 2.5, plusR, 0, 7); CX.fill();
+  const pg = CX.createLinearGradient(0, plusY - plusR, 0, plusY + plusR);
+  pg.addColorStop(0, '#8df06c'); pg.addColorStop(1, '#38b04b');
+  CX.fillStyle = pg;
+  CX.beginPath(); CX.arc(plusX, plusY, plusR, 0, 7); CX.fill();
+  CX.strokeStyle = '#ffffff'; CX.lineWidth = 3.2; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(plusX - 5.5, plusY); CX.lineTo(plusX + 5.5, plusY);
+  CX.moveTo(plusX, plusY - 5.5); CX.lineTo(plusX, plusY + 5.5);
+  CX.stroke();
+  CX.restore();
+  // small round buttons
+  for (const b of BTNS) if (b.shape === 'c') drawRoundBtn(b);
+  // bottom row: booster tray + aquarium tile
+  for (const b of BTNS) {
+    if (b.id === 'aquarium') drawAquariumTile(b);
+    else if (b.shape === 'r' && b.id !== 'shop') drawBoosterBtn(b, dt);
+  }
+}
+function drawRoundBtn(b) {
+  const press = 1 - (PRESS[b.id] || 0) * 0.15;
+  CX.save();
+  if (b.id === 'undo' && !G.undoStack.length) CX.globalAlpha = 0.5;
+  CX.translate(b.x, b.y); CX.scale(press, press); CX.translate(-b.x, -b.y);
+  CX.fillStyle = '#b89ae8';
+  CX.beginPath(); CX.arc(b.x, b.y + 2.5, b.r, 0, 7); CX.fill();
+  const rbg = CX.createLinearGradient(0, b.y - b.r, 0, b.y + b.r);
+  rbg.addColorStop(0, '#ffffff'); rbg.addColorStop(1, '#efe8ff');
+  CX.fillStyle = rbg;
+  CX.strokeStyle = 'rgba(150,110,230,0.35)';
+  CX.lineWidth = 1.5;
+  CX.beginPath(); CX.arc(b.x, b.y, b.r, 0, 7); CX.fill(); CX.stroke();
+  CX.strokeStyle = '#7b3ff2'; CX.fillStyle = '#7b3ff2';
+  CX.lineWidth = 2.1; CX.lineCap = 'round';
+  if (b.id === 'profile') {
+    const u = PFAuth.user();
+    if (PFAuth.signedIn() && u) {
+      CX.fillStyle = '#7b3ff2';
+      CX.beginPath(); CX.arc(b.x, b.y, 10.5, 0, 7); CX.fill();
+      CX.fillStyle = '#ffffff';
+      CX.font = fnt(800, 13); CX.textAlign = 'center';
+      CX.fillText((u.name || 'P').slice(0, 1).toUpperCase(), b.x, b.y + 4.5);
+    } else {
+      CX.beginPath(); CX.arc(b.x, b.y - 3.5, 4.2, 0, 7); CX.fill();
+      CX.beginPath(); CX.arc(b.x, b.y + 8, 7.5, Math.PI + 0.25, -0.25); CX.fill();
+    }
+  } else if (b.id === 'restart') {
+    CX.beginPath(); CX.arc(b.x, b.y, 6, -0.6, 4.6); CX.stroke();
+    CX.beginPath(); CX.moveTo(b.x + 8, b.y - 5); CX.lineTo(b.x + 2.6, b.y - 6); CX.lineTo(b.x + 6, b.y - 1); CX.closePath(); CX.fill();
+  } else if (b.id === 'settings') {
+    CX.save();
+    CX.translate(b.x, b.y);
+    for (let i = 0; i < 8; i++) {
+      CX.save(); CX.rotate(i * Math.PI / 4);
+      CX.fillRect(-1.8, -9.6, 3.6, 4.2);
+      CX.restore();
+    }
+    CX.lineWidth = 3.4;
+    CX.beginPath(); CX.arc(0, 0, 5.4, 0, 7); CX.stroke();
+    CX.restore();
+  }
+  CX.restore();
+}
+function drawBoosterBtn(b, dt) {
+  if (b.id === 'undo') {
+    // free tool: glass face so it reads differently from paid boosters
+    const press2 = 1 - (PRESS.undo || 0) * 0.10;
+    CX.save();
+    const ux = b.x + b.w / 2, uy = b.y + b.h / 2;
+    CX.translate(ux, uy); CX.scale(press2, press2); CX.translate(-ux, -uy);
+    if (!G.undoStack.length) CX.globalAlpha = 0.45;
+    chunkyCapsule(b.x, b.y, b.w, b.h, 18, '#ffffff', '#efe8ff', '#b89ae8');
+    CX.strokeStyle = '#7b3ff2'; CX.fillStyle = '#7b3ff2';
+    CX.lineWidth = 2.2; CX.lineCap = 'round';
+    CX.save();
+    CX.translate(ux, uy - 1); CX.scale(1.35, 1.35);
+    CX.beginPath(); CX.arc(1, 1, 6, -2.4, 2.2); CX.stroke();
+    CX.beginPath(); CX.moveTo(-7.5, -3); CX.lineTo(-1.5, -6.5); CX.lineTo(-2.5, 0.5); CX.closePath(); CX.fill();
+    CX.restore();
+    CX.restore();
+    return;
+  }
+  const affordable = b.id === 'vial' ? (G.coins >= b.cost && G.vials < ECON.vialMax)
+    : b.id === 'pipette' || b.id === 'catalyst'
+      ? (G.coins >= b.cost && PF.powerTargets(G.state, b.id).length > 0)
+    : G.coins >= b.cost;
+  const press = 1 - (PRESS[b.id] || 0) * 0.10;
+  CX.save();
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  CX.translate(cx, cy); CX.scale(press, press); CX.translate(-cx, -cy);
+  CX.globalAlpha = affordable ? 1 : 0.42;
+  const FACES = {
+    vial: ['#c07bff', '#8f46e6', '#5c2aa0'],
+    shuffle: ['#54d9e8', '#2a9fc0', '#17708c'],
+    pipette: ['#9fd4ff', '#4f8fe0', '#28568f'],
+    catalyst: ['#ffd23f', '#ff9f2e', '#a86200'],
+  };
+  const fc = FACES[b.id];
+  if (G.arm === b.id) {
+    CX.save();
+    CX.shadowColor = fc[0]; CX.shadowBlur = 14 + Math.sin(G.t * 7) * 6;
+    chunkyCapsule(b.x, b.y, b.w, b.h, 18, fc[0], fc[1], fc[2], true);
+    CX.restore();
+    CX.strokeStyle = '#ffffff';
+    CX.lineWidth = 2.5;
+    CX.globalAlpha = 0.6 + 0.4 * Math.sin(G.t * 7);
+    rr(b.x - 3, b.y - 3, b.w + 6, b.h + 6, 20); CX.stroke();
+    CX.globalAlpha = 1;
+  } else {
+    chunkyCapsule(b.x, b.y, b.w, b.h, 18, fc[0], fc[1], fc[2], (PRESS[b.id] || 0) > 0.4);
+  }
+  // icon, centered and enlarged (labels live on the badge, genre-standard)
+  CX.save();
+  CX.strokeStyle = '#ffffff'; CX.fillStyle = '#ffffff';
+  CX.lineWidth = 2.2; CX.lineCap = 'round'; CX.lineJoin = 'round';
+  CX.translate(b.x + b.w / 2, b.y + b.h / 2 - 3);
+  CX.scale(1.35, 1.35);
+  const ix = 0, iy = 0;
+  if (b.id === 'shuffle') {
+    CX.beginPath(); CX.arc(ix, iy, 7.5, -0.35, 2.25); CX.stroke();
+    CX.beginPath(); CX.moveTo(ix + 8.6, iy - 5.2); CX.lineTo(ix + 3.0, iy - 7.0); CX.lineTo(ix + 6.6, iy - 1.2); CX.closePath(); CX.fill();
+    CX.beginPath(); CX.arc(ix, iy, 7.5, Math.PI - 0.35, Math.PI + 2.25); CX.stroke();
+    CX.beginPath(); CX.moveTo(ix - 8.6, iy + 5.2); CX.lineTo(ix - 3.0, iy + 7.0); CX.lineTo(ix - 6.6, iy + 1.2); CX.closePath(); CX.fill();
+  } else if (b.id === 'vial') {
+    CX.beginPath();
+    CX.moveTo(ix - 3.5, iy - 8); CX.lineTo(ix - 3.5, iy - 1); CX.lineTo(ix - 6.5, iy + 6);
+    CX.quadraticCurveTo(ix - 7.5, iy + 9, ix - 4.5, iy + 9); CX.lineTo(ix + 4.5, iy + 9);
+    CX.quadraticCurveTo(ix + 7.5, iy + 9, ix + 6.5, iy + 6); CX.lineTo(ix + 3.5, iy - 1); CX.lineTo(ix + 3.5, iy - 8);
+    CX.stroke();
+    CX.beginPath(); CX.moveTo(ix + 9, iy - 6); CX.lineTo(ix + 15, iy - 6); CX.moveTo(ix + 12, iy - 9); CX.lineTo(ix + 12, iy - 3); CX.stroke();
+  } else if (b.id === 'pipette') {
+    // a dropper with a bulb and a falling drop
+    CX.beginPath();
+    CX.moveTo(ix - 3, iy - 9); CX.lineTo(ix + 3, iy - 9); CX.lineTo(ix + 3, iy + 1);
+    CX.lineTo(ix, iy + 6); CX.lineTo(ix - 3, iy + 1); CX.closePath();
+    CX.stroke();
+    CX.fillRect(ix - 4.5, iy - 12, 9, 3.5);
+    CX.beginPath();
+    CX.moveTo(ix, iy + 8.5); CX.quadraticCurveTo(ix + 3, iy + 12, ix, iy + 13.5);
+    CX.quadraticCurveTo(ix - 3, iy + 12, ix, iy + 8.5);
+    CX.fill();
+  } else if (b.id === 'catalyst') {
+    // one drop splitting into two
+    CX.beginPath();
+    CX.moveTo(ix, iy - 10); CX.quadraticCurveTo(ix + 5, iy - 4, ix, iy - 1);
+    CX.quadraticCurveTo(ix - 5, iy - 4, ix, iy - 10);
+    CX.fill();
+    CX.lineWidth = 2;
+    CX.beginPath(); CX.moveTo(ix - 1.5, iy + 1); CX.lineTo(ix - 7, iy + 5);
+    CX.moveTo(ix + 1.5, iy + 1); CX.lineTo(ix + 7, iy + 5);
+    CX.stroke();
+    CX.beginPath(); CX.arc(ix - 8.5, iy + 8, 3.2, 0, 7); CX.fill();
+    CX.beginPath(); CX.arc(ix + 8.5, iy + 8, 3.2, 0, 7); CX.fill();
+  }
+  CX.restore();
+  // price / state badge hanging off the bottom edge
+  const bcx = b.x + b.w / 2, bcy = b.y + b.h - 6;
+  CX.font = fnt(800, 11);
+  if (b.id === 'vial' && G.vials >= ECON.vialMax) {
+    const tw2 = CX.measureText('MAX').width + 16;
+    chunkyCapsule(bcx - tw2 / 2, bcy - 9, tw2, 18, 9, '#e7e2f2', '#c9c2dd', '#8f86ab');
+    outlinedText('MAX', bcx, bcy + 4.5, 11, '#5c5478', '#4a436a', 'rgba(0,0,0,0)');
+  } else {
+    CX.font = fnt(800, 12);
+    const tw2 = CX.measureText(String(b.cost)).width + 30;
+    chunkyCapsule(bcx - tw2 / 2, bcy - 9.5, tw2, 19, 9.5, '#fff6e0', '#ffe9b8', '#d9a860');
+    drawCoin(bcx - tw2 / 2 + 12, bcy, 7);
+    outlinedText(String(b.cost), bcx - tw2 / 2 + 21, bcy + 4.5, 12, '#c47510', '#8a5200', 'rgba(0,0,0,0)', 'left');
+  }
+  CX.restore();
+}
+
+function drawAquariumTile(b) {
+  const press = 1 - (PRESS['aquarium'] || 0) * 0.12;
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  CX.save();
+  CX.translate(cx, cy); CX.scale(press, press); CX.translate(-cx, -cy);
+  // attention pulse while food is waiting
+  if (AQ.food > 0) {
+    CX.strokeStyle = '#5ee7d4';
+    CX.globalAlpha = 0.5 + 0.3 * Math.sin(G.t * 4);
+    CX.lineWidth = 3;
+    rr(b.x - 4, b.y - 4, b.w + 8, b.h + 8, 19); CX.stroke();
+    CX.globalAlpha = 1;
+  }
+  // chunky drop + water window
+  CX.fillStyle = '#b89ae8';
+  rr(b.x, b.y + 3.5, b.w, b.h, 16); CX.fill();
+  const wg = CX.createLinearGradient(0, b.y, 0, b.y + b.h);
+  wg.addColorStop(0, '#5fc6f5'); wg.addColorStop(1, '#1256a5');
+  CX.fillStyle = wg;
+  rr(b.x, b.y, b.w, b.h, 16); CX.fill();
+  CX.save();
+  rr(b.x, b.y, b.w, b.h, 16); CX.clip();
+  // sand
+  CX.fillStyle = '#eed7a3';
+  CX.beginPath();
+  CX.moveTo(b.x, b.y + b.h - 9);
+  CX.quadraticCurveTo(cx, b.y + b.h - 15, b.x + b.w, b.y + b.h - 7);
+  CX.lineTo(b.x + b.w, b.y + b.h); CX.lineTo(b.x, b.y + b.h);
+  CX.closePath(); CX.fill();
+  // weed sprig
+  CX.strokeStyle = '#2fae6e'; CX.lineWidth = 2.4; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(b.x + 10, b.y + b.h - 9);
+  CX.quadraticCurveTo(b.x + 7 + Math.sin(G.t * 1.4) * 2, b.y + b.h - 19, b.x + 12, b.y + b.h - 26);
+  CX.stroke();
+  // your first fish lives on the tile (bobbing); a glyph before any fish exist
+  const f = AQ.fish[0];
+  const fy = cy - 2 + Math.sin(G.t * 1.6) * 2.5;
+  if (f) {
+    const sc = Math.min(1.15, 30 / PFFish.sizePx(f));
+    PFFish.draw(CX, f, cx + 2, fy, G.t, 1, sc);
+  } else {
+    CX.fillStyle = 'rgba(255,255,255,0.9)';
+    CX.beginPath(); CX.ellipse(cx + 3, fy, 9, 5.5, 0, 0, 7); CX.fill();
+    CX.beginPath();
+    CX.moveTo(cx - 5, fy); CX.lineTo(cx - 12, fy - 5); CX.lineTo(cx - 12, fy + 5);
+    CX.closePath(); CX.fill();
+    CX.fillStyle = '#1256a5';
+    CX.beginPath(); CX.arc(cx + 7.5, fy - 1.5, 1.4, 0, 7); CX.fill();
+  }
+  // rising bubble
+  CX.fillStyle = 'rgba(255,255,255,0.55)';
+  const bb = (G.t * 9) % (b.h - 14);
+  CX.beginPath(); CX.arc(b.x + b.w - 11, b.y + b.h - 8 - bb, 2.1, 0, 7); CX.fill();
+  CX.restore();
+  // glass frame
+  CX.strokeStyle = '#ffffff'; CX.lineWidth = 2.5;
+  rr(b.x, b.y, b.w, b.h, 16); CX.stroke();
+  // food badge
+  if (AQ.food > 0) {
+    CX.fillStyle = '#5ee7d4';
+    CX.strokeStyle = '#0a4f45'; CX.lineWidth = 1.5;
+    CX.beginPath(); CX.arc(b.x + b.w - 3, b.y + 3, 10, 0, 7); CX.fill(); CX.stroke();
+    CX.fillStyle = '#0a4f45';
+    CX.font = fnt(800, 11); CX.textAlign = 'center';
+    CX.fillText(AQ.food > 99 ? '99' : String(AQ.food), b.x + b.w - 3, b.y + 7);
+  }
+  // hunger warning takes the top-left corner: a fish is about to leave
+  if (FISHCFG.lossOn && hungryCount()) {
+    CX.save();
+    CX.globalAlpha = 0.75 + 0.25 * Math.sin(G.t * 5);
+    CX.fillStyle = '#ff5f7e';
+    CX.strokeStyle = '#6d0f26'; CX.lineWidth = 1.5;
+    CX.beginPath(); CX.arc(b.x + b.w / 2, b.y - 2, 10, 0, 7); CX.fill(); CX.stroke();
+    CX.fillStyle = '#ffffff';
+    CX.font = fnt(800, 13); CX.textAlign = 'center';
+    CX.fillText('!', b.x + b.w / 2, b.y + 3);
+    CX.restore();
+  }
+  // tank progress: the earned stars ride on the tile
+  const st = tankStars();
+  for (let i = 0; i < 3; i++) {
+    const sx = b.x + 12 + i * 13, sy = b.y + b.h + 4;
+    if (i < st) drawStar(sx, sy, 6, GOLD);
+    else { CX.fillStyle = 'rgba(255,255,255,0.28)'; CX.beginPath(); CX.arc(sx, sy, 3, 0, 7); CX.fill(); }
+  }
+  CX.restore();
+}
+
+/* While a powerup is armed, every legal target breathes and everything else
+   dims — so it is obvious what the tool can act on. */
+function drawArmHighlights() {
+  if (!G.arm || G.phase !== 'play') return;
+  const targets = PF.powerTargets(G.state, G.arm);
+  const pulse = 0.5 + 0.5 * Math.sin(G.t * 6);
+  const col = G.arm === 'catalyst' ? '#ffd23f' : '#9fd4ff';
+  CX.save();
+  for (const i of targets) {
+    const sl = G.slots[i];
+    if (!sl) continue;
+    CX.strokeStyle = col;
+    CX.globalAlpha = 0.45 + pulse * 0.5;
+    CX.lineWidth = 3.5;
+    CX.shadowColor = col; CX.shadowBlur = 10;
+    rr(sl.x - 8, sl.y - 22, sl.w + 16, sl.h + 32, 12);
+    CX.stroke();
+  }
+  CX.restore();
+  // prompt strip just above the tray
+  const P = POWERS[G.arm];
+  CX.save();
+  CX.font = fnt(800, 13);
+  const txt = P.name + ' \u2014 ' + P.prompt.toUpperCase();
+  const tw = CX.measureText(txt).width + 30;
+  const ty = H - 104;
+  CX.fillStyle = 'rgba(12,6,34,0.82)';
+  rr(W / 2 - tw / 2, ty - 17, tw, 32, 16); CX.fill();
+  CX.strokeStyle = col; CX.lineWidth = 2;
+  rr(W / 2 - tw / 2, ty - 17, tw, 32, 16); CX.stroke();
+  CX.fillStyle = col; CX.textAlign = 'center';
+  CX.fillText(txt, W / 2, ty + 5);
+  CX.restore();
+}
+
+function drawHint(dt) {
+  if (!G.hint) return;
+  G.hintT += dt;
+  if (G.hint.soft && G.hintT > 3.5) G.hint.soft = false;   // escalate to the arrow
+  if (G.hintT > 9) { G.hint = null; G.idleT = 0; return; }
+  const A = G.slots[G.hint.from], B = G.slots[G.hint.to];
+  if (!A || !B) return;
+  const pulse = 0.5 + 0.5 * Math.sin(G.t * 6);
+  if (G.hint.soft) {
+    // gentle nudge first: the best-move flask breathes with a golden halo
+    CX.save();
+    CX.strokeStyle = '#ffe36a';
+    CX.globalAlpha = 0.30 + pulse * 0.45;
+    CX.lineWidth = 4;
+    CX.shadowColor = '#ffd93d'; CX.shadowBlur = 14;
+    rr(A.x - 9, A.y - 24, A.w + 18, A.h + 34, 12);
+    CX.stroke();
+    CX.restore();
+    return;
+  }
+  for (const [s, col] of [[A, '#ffffff'], [B, '#ffd93d']]) {
+    CX.save();
+    CX.strokeStyle = col;
+    CX.globalAlpha = 0.55 + pulse * 0.4;
+    CX.lineWidth = 3;
+    rr(s.x - 9, s.y - 24, s.w + 18, s.h + 34, 12);
+    CX.stroke();
+    CX.restore();
+  }
+  CX.save();
+  CX.globalAlpha = 0.92;
+  CX.strokeStyle = '#ffffff';
+  CX.lineWidth = 4.5;
+  CX.lineCap = 'round';
+  CX.shadowColor = 'rgba(24,8,56,0.65)';
+  CX.shadowBlur = 6;
+  const ax = A.x + A.w / 2, ay = A.y - 28, bx = B.x + B.w / 2, by = B.y - 28;
+  CX.beginPath(); CX.moveTo(ax, ay);
+  CX.quadraticCurveTo((ax + bx) / 2, Math.min(ay, by) - 26, bx, by);
+  CX.stroke();
+  const angA = Math.atan2(by - (Math.min(ay, by) - 26), bx - (ax + bx) / 2);
+  CX.beginPath();
+  CX.moveTo(bx, by);
+  CX.lineTo(bx - Math.cos(angA - 0.45) * 10, by - Math.sin(angA - 0.45) * 10);
+  CX.moveTo(bx, by);
+  CX.lineTo(bx - Math.cos(angA + 0.45) * 10, by - Math.sin(angA + 0.45) * 10);
+  CX.stroke();
+  CX.restore();
+}
+
+/* ---------- win screen ---------- */
+function drawWin(dt) {
+  G.winT += dt;
+  const wd = G.winData;
+  const k = Math.min(1, G.winT / 0.4);
+  CX.fillStyle = 'rgba(40,10,80,' + 0.55 * k + ')';
+  CX.fillRect(0, 0, W, H);
+  // card (taller when it also announces a new fish)
+  const cw = Math.min(W - 48, 360), ch = 344 + (wd.newFish ? 34 : 0);
+  const cx = W / 2 - cw / 2, cy = H * 0.47 - ch / 2;
+  CX.save();
+  const popK = easeOutBack(Math.min(1, G.winT / 0.35));
+  CX.translate(W / 2, H * 0.47); CX.scale(popK, popK); CX.translate(-W / 2, -H * 0.47);
+  CX.fillStyle = '#fff6ea';
+  rr(cx, cy, cw, ch, 24); CX.fill();
+  const cg = CX.createLinearGradient(cx, cy, cx, cy + ch);
+  cg.addColorStop(0, 'rgba(255,255,255,0.08)'); cg.addColorStop(1, 'rgba(255,255,255,0)');
+  CX.fillStyle = cg; rr(cx, cy, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = 'rgba(120,30,220,0.6)'; CX.shadowBlur = 26;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx, cy, cw, ch, 24); CX.stroke();
+  CX.restore();
+  // rotating rays behind the stars, clipped to the card
+  const starGap = 50, starY = cy + 108;
+  CX.save();
+  rr(cx, cy, cw, ch, 24); CX.clip();
+  drawRays(W / 2, starY, 130, GOLD, 0.10);
+  CX.restore();
+  // ribbon header overlapping the card's top edge
+  drawRibbon(W / 2, cy + 4, Math.min(cw * 0.74, 250), 46, 'LEVEL ' + G.level, 20);
+  outlinedText('CLEAR!', W / 2, cy + 66, 24, '#ffe36a', '#ffb42e', 'rgba(90,50,0,0.95)');
+  // stars pop one by one with sparkle on landing
+  for (let i = 0; i < 3; i++) {
+    const when = 0.45 + i * 0.22;
+    const got = i < wd.stars;
+    const sk = Math.min(1, Math.max(0, (G.winT - when) / 0.22));
+    if (got && sk > 0 && wd.starsShown <= i) {
+      wd.starsShown = i + 1; Aud.star(i); hapt(15);
+      burst(W / 2 + (i - 1) * starGap, starY, ['#ffe793', GOLD, '#ffffff'], 12, 130, 60);
+    }
+    const r = (i === 1 ? 25 : 20) * (got ? easeOutBack(sk) : 1);
+    if (got && sk === 0) continue;
+    drawStar(W / 2 + (i - 1) * starGap, starY - (i === 1 ? 5 : 0), r, GOLD, !got);
+  }
+  if (wd.stars === 3) {
+    outlinedText('PERFECT!', W / 2, starY + 48, 15, '#8dffb8', '#3ddc84', 'rgba(0,70,26,0.9)');
+  }
+  // NEW FISH banner — the meta reward deserves the spotlight, not a toast
+  const fishOff = wd.newFish ? 34 : 0;
+  if (wd.newFish && G.winT > 0.8) {
+    const f = wd.newFish, byy = cy + 164;
+    CX.fillStyle = 'rgba(94,231,212,0.18)';
+    rr(cx + 22, byy, cw - 44, 40, 14); CX.fill();
+    CX.strokeStyle = 'rgba(14,110,96,0.35)'; CX.lineWidth = 1.5;
+    rr(cx + 22, byy, cw - 44, 40, 14); CX.stroke();
+    const sc = Math.min(1, 26 / PFFish.sizePx(f));
+    PFFish.draw(CX, f, cx + 52, byy + 20 + Math.sin(G.t * 2.2) * 2, G.t, 1, sc);
+    CX.textAlign = 'left';
+    CX.fillStyle = '#0e6e60'; CX.font = fnt(800, 14);
+    CX.fillText('NEW FISH: ' + f.name.toUpperCase() + '!', cx + 82, byy + 18);
+    CX.fillStyle = '#4a9a8e'; CX.font = fnt(600, 11);
+    CX.fillText(PFFish.speciesName(f) + ' joined your aquarium', cx + 82, byy + 33);
+  }
+  // reward lines (spacing compresses so long lists never hit the buttons)
+  const lsp = wd.lines.length > 4 ? 19 : wd.lines.length > 3 ? 21 : 25;
+  let ly = cy + fishOff + (wd.lines.length > 3 ? 188 : 192 + (3 - wd.lines.length) * 9);
+  wd.lines.forEach((l, i) => {
+    if (G.winT < 0.9 + i * 0.18) return;
+    CX.textAlign = 'left';
+    CX.fillStyle = '#6b4d8f';
+    CX.font = fnt(600, 14);
+    CX.fillText(l[0], cx + 34, ly + i * lsp);
+    outlinedText('+' + l[1], cx + cw - 58, ly + i * lsp, 14, '#fff3cf', '#ffe9a8', 'rgba(70,42,0,0.85)', 'right');
+    drawCoin(cx + cw - 44, ly + i * lsp - 5, 8);
+  });
+  // CTA row: [×2 AD] + COLLECT while uncollected and ads remain; else one button
+  const bw = cw - 64, bh = 52, bx = W / 2 - bw / 2, by = cy + ch - bh - 20;
+  const offerX2 = !wd.granted && wd.offerX2 && wd.total > 0;
+  const pulse = 1 + Math.sin(G.t * 4) * 0.02;
+  CX.save();
+  CX.translate(W / 2, by + bh / 2); CX.scale(pulse, pulse); CX.translate(-W / 2, -(by + bh / 2));
+  if (offerX2) {
+    const xw = 92, gw = bw - xw - 12, gx = bx + xw + 12;
+    CX.save();
+    CX.shadowColor = '#ffb42e'; CX.shadowBlur = 14;
+    chunkyCapsule(bx, by, xw, bh, 24, '#ffd23f', '#ff9f2e', '#a86200');
+    CX.restore();
+    CX.fillStyle = '#ffffff';
+    CX.beginPath();
+    CX.moveTo(bx + 18, by + 19); CX.lineTo(bx + 30, by + 26); CX.lineTo(bx + 18, by + 33);
+    CX.closePath(); CX.fill();
+    outlinedText('×2', bx + 52, by + 32, 19, '#ffffff', '#fff3cf', 'rgba(120,60,0,0.92)', 'left');
+    CX.font = fnt(800, 9); CX.fillStyle = 'rgba(120,60,0,0.85)';
+    CX.textAlign = 'center'; CX.fillText('AD', bx + 25, by + 45);
+    CX.save();
+    CX.shadowColor = '#3ddc84'; CX.shadowBlur = 16;
+    chunkyCapsule(gx, by, gw, bh, 24, '#7ce75a', '#34b24a', '#166e2c');
+    CX.restore();
+    outlinedText('COLLECT +' + wd.total, gx + gw / 2, by + 33, 17, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+    G._winBtns = { x2: { x: bx, y: by, w: xw, h: bh } };
+  } else {
+    CX.save();
+    CX.shadowColor = '#3ddc84'; CX.shadowBlur = 16;
+    chunkyCapsule(bx, by, bw, bh, 26, '#7ce75a', '#34b24a', '#166e2c');
+    CX.restore();
+    outlinedText(wd.granted ? 'NEXT LEVEL  ▶' : 'COLLECT  +' + wd.total, W / 2, by + 33, 18, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+    G._winBtns = null;
+  }
+  CX.restore();
+  CX.restore();
+}
+
+/* ---------- aquarium: state, food economy ---------- */
+const AQ = store.get('aquarium', null) || { food: 0, fish: [], seen: [], best: {} };
+if (!AQ.seen) AQ.seen = [];
+if (!AQ.best) AQ.best = {};      // species index -> biggest cm ever raised
+if (!AQ.decor) AQ.decor = [];    // ornament ids bought for the current tank
+if (AQ.tank == null) AQ.tank = 0;
+if (AQ.tanksDone == null) AQ.tanksDone = 0;
+if (AQ.starsSeen == null) AQ.starsSeen = 0;
+function saveAq() { store.set('aquarium', AQ); }
+/* v2.8 fish economy: species drop weights (live-tunable per species) and the
+ * hunger clock. Fish remember when they last ate; skip feeding for long
+ * enough and they get hungry, then starving, then they swim away. */
+const FISHCFG = { weights: null, hungryH: 24, starveH: 48, loseH: 72, lossOn: true };
+/* v2.9 THE TANK CHASE — replaces the old daily coin dividend.
+ * Genre research (Fishdom/Gardenscapes and the casual-puzzle meta at large):
+ * the aquarium should be a coin SINK the player invests in, not a faucet that
+ * pays out while they are away. Passive income is an idle-game mechanic; here
+ * the loop is play -> earn -> DECORATE -> the tank visibly improves -> stars
+ * -> a brand-new tank to beautify. Short goal: the next ornament. Medium: the
+ * next star. Long: finish this tank and unlock the next one. */
+// `y` is the ornament's base as a fraction of tank height — the floor sits
+// above the bottom button row so nothing important hides behind the UI.
+const DECOR = [
+  { id: 'weed',    name: 'Kelp Cluster',   cost: 60,   beauty: 15,  y: 0.82 },
+  { id: 'rock',    name: 'Rock Cairn',     cost: 110,  beauty: 28,  y: 0.83 },
+  { id: 'coral',   name: 'Coral Fan',      cost: 180,  beauty: 46,  y: 0.80 },
+  { id: 'shell',   name: 'Giant Clam',     cost: 260,  beauty: 68,  y: 0.83 },
+  { id: 'ring',    name: 'Bubble Ring',    cost: 320,  beauty: 84,  y: 0.50 },
+  { id: 'amphora', name: 'Greek Amphora',  cost: 420,  beauty: 112, y: 0.81 },
+  { id: 'lantern', name: 'Deep Lantern',   cost: 520,  beauty: 140, y: 0.42 },
+  { id: 'column',  name: 'Broken Column',  cost: 650,  beauty: 178, y: 0.80 },
+  { id: 'chest',   name: 'Treasure Chest', cost: 820,  beauty: 226, y: 0.83 },
+  { id: 'ship',    name: 'Sunken Ship',    cost: 1100, beauty: 310, y: 0.79 },
+  { id: 'arch',    name: 'Coral Arch',     cost: 1500, beauty: 430, y: 0.74 },
+  { id: 'statue',  name: 'Fish Statue',    cost: 2000, beauty: 580, y: 0.78 },
+];
+function decorById(id) { for (const d of DECOR) if (d.id === id) return d; return null; }
+/* Themed tanks. Each is finished by filling three stars with beauty; the
+ * thresholds grow per tank so the ladder never ends. */
+const TANKS = [
+  { name: 'CORAL COVE',   tint: null },
+  { name: 'SUNKEN RUINS', tint: 'rgba(120,90,200,0.16)' },
+  { name: 'KELP FOREST',  tint: 'rgba(40,190,120,0.15)' },
+  { name: 'DEEP TRENCH',  tint: 'rgba(20,40,120,0.26)' },
+  { name: 'CORAL THRONE', tint: 'rgba(230,120,60,0.16)' },
+];
+const TANKCFG = { star1: 60, star2: 170, star3: 340, mult: 1.8, priceMult: 1 };
+function tankTheme() { return TANKS[Math.min(AQ.tank || 0, TANKS.length - 1)]; }
+function tankName() {
+  const n = AQ.tank || 0;
+  return n < TANKS.length ? TANKS[n].name : 'ABYSS ' + (n - TANKS.length + 2);
+}
+// star thresholds for the current tank
+function tankGoals() {
+  const k = Math.pow(TANKCFG.mult, AQ.tank || 0);
+  return [TANKCFG.star1, TANKCFG.star2, TANKCFG.star3].map(v => Math.round(v * k));
+}
+function decorPrice(d) { return Math.max(1, Math.round(d.cost * TANKCFG.priceMult)); }
+function ownsDecor(id) { return (AQ.decor || []).indexOf(id) >= 0; }
+// what the tank is worth right now: ornaments carry most of it, fish add flair
+function tankBeauty() {
+  let b = 0;
+  for (const id of (AQ.decor || [])) { const d = decorById(id); if (d) b += d.beauty; }
+  for (const f of AQ.fish) b += PFFish.beauty(f);
+  return b;
+}
+function tankStars() {
+  const b = tankBeauty(), g = tankGoals();
+  let n = 0;
+  for (const t of g) if (b >= t) n++;
+  return n;
+}
+/* Buying an ornament is the whole point of coins now. */
+function buyDecor(d) {
+  if (ownsDecor(d.id)) return false;
+  const price = decorPrice(d);
+  if (!spendCoins(price)) { noCoins(); return false; }
+  coinSpendFx(price);
+  AQ.decor.push(d.id); saveAq();
+  PFA.track('decor_bought', { item: d.id, cost: price, tank: AQ.tank || 0,
+    beauty: tankBeauty(), stars: tankStars() });
+  toast(d.name + ' added  ·  +' + d.beauty + ' beauty', 2.4);
+  Aud.buy(); hapt(18);
+  syncTankStars();
+  return true;
+}
+/* Stars are derived from beauty, and beauty moves for more reasons than a
+ * purchase (a fish grows up, a new species arrives, live-ops retunes the
+ * goals). So the milestone is driven off stored state and re-checked whenever
+ * the tank is on screen, not just at the moment of buying. */
+function syncTankStars() {
+  const st = tankStars(), seen = AQ.starsSeen || 0;
+  if (st === seen) return;
+  AQ.starsSeen = st; saveAq();
+  if (st < seen) return;                      // goals moved up: no celebration
+  G.starPop = 1.2;
+  Aud.win(); hapt(35);
+  PFA.track('tank_star', { tank: AQ.tank || 0, star: st, beauty: tankBeauty() });
+  if (st >= 3) tankComplete();
+  else toast('STAR ' + st + ' of 3 earned!', 2.6);
+}
+/* Three stars finishes the tank: a real payout, a permanent trophy, and a
+ * fresh themed tank to start beautifying. Fish and the album carry over. */
+function tankComplete() {
+  if (G.tankDone) return;
+  const n = AQ.tank || 0;
+  const reward = 150 + n * 100;
+  G.tankDone = { t: 0, tank: n, reward, name: tankName() };
+  AQ.tanksDone = (AQ.tanksDone || 0) + 1;
+  PFA.track('tank_complete', { tank: n, beauty: tankBeauty(), fish: AQ.fish.length, reward });
+}
+function tankAdvance() {
+  const d = G.tankDone;
+  G.tankDone = null;
+  if (!d) return;
+  G.coins += d.reward; store.set('coins', G.coins);
+  AQ.food += 5;
+  AQ.tank = (AQ.tank || 0) + 1;
+  AQ.decor = [];                       // the new tank starts bare
+  AQ.starsSeen = tankStars();          // fish alone may already carry a star
+  saveAq();
+  flyCoins(W / 2, H * 0.45, 10);
+  PFA.track('coins_earned', { amount: d.reward, source: 'tank_complete', balance: G.coins });
+  toast('Welcome to ' + tankName() + '!  +5 fish food', 3.2);
+  Aud.win(); hapt(40);
+}
+function markSeen(f) {
+  if (AQ.seen.indexOf(f.sp) < 0) { AQ.seen.push(f.sp); saveAq(); return true; }
+  return false;
+}
+// every fish already in the tank counts as discovered (also migrates old
+// saves). Only write when something actually changed: an unconditional save
+// here would persist the empty default if the load ever read back blank.
+let aqMigrated = false;
+for (const f of AQ.fish) {
+  if (AQ.seen.indexOf(f.sp) < 0) { AQ.seen.push(f.sp); aqMigrated = true; }
+  if (!f.lastFed) { f.lastFed = Date.now(); aqMigrated = true; }   // pre-v2.8 fish
+  const cm = PFFish.sizeCm(f);
+  if (!(AQ.best[f.sp] >= cm)) { AQ.best[f.sp] = cm; aqMigrated = true; }
+}
+if (aqMigrated) saveAq();
+// remember the biggest of each species ever raised, so the album keeps the
+// record even after that fish is gone
+function recordBest(f) {
+  const cm = PFFish.sizeCm(f);
+  if (!(AQ.best[f.sp] >= cm)) { AQ.best[f.sp] = cm; saveAq(); }
+}
+function newFish(source) {
+  const f = PFFish.mkFish(Math.random, G.level, null, FISHCFG.weights);
+  f.fresh = markSeen(f);                        // NEW-species banner flag
+  recordBest(f);
+  return f;
+}
+function fishState(f) { return PFFish.hungerState(f, Date.now(), FISHCFG); }
+function hungryCount() {
+  let n = 0;
+  for (const f of AQ.fish) if (fishState(f) !== 'fed') n++;
+  return n;
+}
+/* Reap fish that went unfed past the loss deadline. Runs on boot, on every
+ * aquarium open and after each win, so the player always learns about it. */
+function reapStarved() {
+  if (!FISHCFG.lossOn || !AQ.fish.length) return 0;
+  const lost = [];
+  for (let i = AQ.fish.length - 1; i >= 0; i--) {
+    if (PFFish.hungerState(AQ.fish[i], Date.now(), FISHCFG) === 'lost') {
+      lost.push(AQ.fish[i]);
+      recordBest(AQ.fish[i]);              // the album keeps the record
+      PFA.track('fish_lost', {
+        species: PFFish.speciesName(AQ.fish[i]), level: G.level,
+        fed: AQ.fish[i].fed, fish_left: AQ.fish.length - 1,
+      });
+      delete SWIM[AQ.fish[i].id];
+      AQ.fish.splice(i, 1);
+    }
+  }
+  if (lost.length) {
+    saveAq();
+    toast(lost.length === 1
+      ? lost[0].name + ' got too hungry and swam away…'
+      : lost.length + ' hungry fish swam away…', 3.4);
+    Aud.deny(); hapt(30);
+  }
+  return lost.length;
+}
+const SWIM = {};   // per-fish runtime swim state
+const FLAKES = [];
+function swimInit() {
+  for (const f of AQ.fish) {
+    if (!SWIM[f.id]) {
+      SWIM[f.id] = {
+        x: W * (0.15 + Math.random() * 0.7),
+        y: H * (0.22 + Math.random() * 0.5),
+        dir: Math.random() < 0.5 ? -1 : 1,
+        speed: 14 + Math.random() * 22,
+        wob: Math.random() * 7,
+        turnT: 2 + Math.random() * 4,
+      };
+    }
+  }
+}
+
+/* ---------- shop + rewarded ads (full cycle, pluggable network) ---------- */
+const ADS = { perDay: 5, reward: 30 };
+const SHOP_FOOD = { qty: 5, cost: 40 };
+const SHOP_EGG = { cost: 150 };
+const AD_TIPS = [
+  'Fusion works even into FULL flasks!',
+  'HARD levels pay double coins — every 8th level.',
+  'Perfect clears build your streak bonus.',
+  'Feed one favorite fish to grow it fastest.',
+  'Order flasks are one-way — pour with intent!',
+];
+function adsLeftToday() {
+  const today = new Date().toDateString();
+  if (store.get('adDay', '') !== today) return ADS.perDay;
+  return Math.max(0, ADS.perDay - store.get('adCount', 0));
+}
+function consumeAd() {
+  const today = new Date().toDateString();
+  if (store.get('adDay', '') !== today) { store.set('adDay', today); store.set('adCount', 0); }
+  store.set('adCount', store.get('adCount', 0) + 1);
+}
+function grantAdReward() {
+  consumeAd();
+  G.coins += ADS.reward; store.set('coins', G.coins);
+  G.pillPulse = 1;
+  flyCoins(W / 2, H * 0.5, 8);
+  Aud.win(); hapt(30);
+  PFA.track('ad_rewarded', { amount: ADS.reward, left: adsLeftToday(), balance: G.coins });
+  toast('+' + ADS.reward + ' coins — thanks for watching!', 2.2);
+}
+function startAd(placement, onReward) {
+  // one rewarded-ad pipeline, many placements: shop coins (default), win x2, ...
+  placement = placement || 'shop_coins';
+  onReward = onReward || grantAdReward;
+  if (!adsLeftToday()) { toast('No more ads today — come back tomorrow!', 2.2); Aud.deny(); return; }
+  PFA.track('ad_started', { placement });
+  function houseAd() {
+    G.ad = { t: 0, dur: 5, tip: AD_TIPS[Math.floor(Math.random() * AD_TIPS.length)], onReward, placement };
+  }
+  if (window.Android && window.Android.showRewardedAd) {
+    // native ad network hook (AdMob etc.): Android calls window.__onRewardedAd(ok),
+    // or window.__onRewardedAdUnavailable() when it has no fill — then the
+    // built-in house ad serves the request instead (same full-watch semantics)
+    window.__onRewardedAd = function (ok) {
+      if (ok) onReward();
+      else { toast('Ad not completed', 2.0); PFA.track('ad_abandoned', { placement }); }
+    };
+    window.__onRewardedAdUnavailable = function () {
+      PFA.track('ad_no_fill', { placement });
+      houseAd();
+    };
+    window.Android.showRewardedAd();
+  } else {
+    // built-in house ad: same contract — full watch => reward
+    houseAd();
+  }
+}
+function drawAd(dt) {
+  if (!G.ad) return;
+  G.ad.t += dt;
+  const done = G.ad.t >= G.ad.dur;
+  CX.save();
+  const g = CX.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#123a5e'); g.addColorStop(1, '#071c30');
+  CX.fillStyle = g; CX.fillRect(0, 0, W, H);
+  CX.fillStyle = 'rgba(255,255,255,0.5)';
+  CX.font = fnt(600, 12); CX.textAlign = 'center';
+  CX.fillText('A word from the Potion Lab', W / 2, 44);
+  drawFlaskBody({ units: ['O', 'O', 'O'], order: null, done: false },
+    { x: W / 2 - 40, y: H * 0.16, w: 80, h: 106, kind: 'order' }, false, 0);
+  outlinedText('POTION TIP', W / 2, H * 0.42, 24, '#ffe36a', '#ffb42e', 'rgba(120,60,0,0.92)');
+  CX.fillStyle = '#eaf4ff';
+  CX.font = fnt(600, 16);
+  CX.fillText(G.ad.tip, W / 2, H * 0.48);
+  // countdown ring / claim
+  const btns = [];
+  if (!done) {
+    const frac = G.ad.t / G.ad.dur;
+    CX.strokeStyle = 'rgba(255,255,255,0.25)'; CX.lineWidth = 5;
+    CX.beginPath(); CX.arc(W - 40, 44, 16, 0, 7); CX.stroke();
+    CX.strokeStyle = '#ffd93d';
+    CX.beginPath(); CX.arc(W - 40, 44, 16, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); CX.stroke();
+    CX.fillStyle = '#ffffff'; CX.font = fnt(800, 13);
+    CX.fillText(String(Math.ceil(G.ad.dur - G.ad.t)), W - 40, 49);
+    // early close = abandon, no reward
+    btns.push({ id: 'abandon', x: 40, y: 44, r: 16 });
+    CX.strokeStyle = 'rgba(255,255,255,0.5)'; CX.lineWidth = 3; CX.lineCap = 'round';
+    CX.beginPath();
+    CX.moveTo(34, 38); CX.lineTo(46, 50); CX.moveTo(46, 38); CX.lineTo(34, 50);
+    CX.stroke();
+  } else {
+    const bw = Math.min(W - 100, 280), bx = W / 2 - bw / 2, by = H * 0.62;
+    CX.save();
+    CX.shadowColor = '#3ddc84'; CX.shadowBlur = 16;
+    chunkyCapsule(bx, by, bw, 54, 27, '#7ce75a', '#34b24a', '#166e2c');
+    CX.restore();
+    outlinedText(G.ad.placement === 'win_x2' ? 'CLAIM  ×2 COINS' : 'CLAIM  +' + ADS.reward,
+      W / 2, by + 34, 18, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+    btns.push({ id: 'claim', x: bx, y: by, w: bw, h: 54 });
+  }
+  CX.restore();
+  G._adBtns = btns;
+}
+function adTap(x, y) {
+  const done = G.ad.t >= G.ad.dur;
+  const at = Math.round(G.ad.t * 10) / 10;
+  const fin = G.ad.onReward || grantAdReward, pl = G.ad.placement;
+  for (const b of (G._adBtns || [])) {
+    if (hitRect(b, x, y)) {
+      G.ad = null;
+      if (b.id === 'claim') { PFA.track('ad_completed', { placement: pl }); fin(); }
+      else { PFA.track('ad_abandoned', { at, placement: pl }); toast('Watch the full ad to earn the reward', 2.0); Aud.deny(); }
+      return;
+    }
+  }
+  if (done) { G.ad = null; PFA.track('ad_completed', { placement: pl }); fin(); }
+}
+
+function drawConsent(dt) {
+  if (!G.consent) return;
+  CX.save();
+  CX.fillStyle = 'rgba(30,8,64,0.72)';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 48, 340), ch = 282;
+  const cx0 = W / 2 - cw / 2, cy0 = H * 0.44 - ch / 2;
+  CX.fillStyle = '#fff6ea';
+  rr(cx0, cy0, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = 'rgba(120,30,220,0.6)'; CX.shadowBlur = 22;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx0, cy0, cw, ch, 24); CX.stroke();
+  CX.restore();
+  outlinedText('HELP THE POTION LAB?', W / 2, cy0 + 44, 19, '#7b3ff2', '#5b2be0', 'rgba(0,0,0,0)');
+  CX.fillStyle = '#6b4d8f'; CX.font = fnt(600, 13.5); CX.textAlign = 'center';
+  const lines = [
+    'Share anonymous gameplay stats (levels,',
+    'coins, boosters) to help balance the game.',
+    'No personal data, no ad tracking, and you',
+    'can change this any time in Settings.',
+  ];
+  lines.forEach((l, i) => CX.fillText(l, W / 2, cy0 + 78 + i * 20));
+  // published so the geometry audit can assert the buttons clear the copy
+  G._consentCard = { x: cx0, y: cy0, w: cw, h: ch, lastLine: cy0 + 78 + (lines.length - 1) * 20 };
+  const bw = cw - 56, bh = 46, bx = W / 2 - bw / 2;
+  const y1 = cy0 + ch - 2 * bh - 30;
+  CX.save();
+  CX.shadowColor = '#3ddc84'; CX.shadowBlur = 14;
+  chunkyCapsule(bx, y1, bw, bh, 23, '#7ce75a', '#34b24a', '#166e2c');
+  CX.restore();
+  outlinedText('SHARE STATS', W / 2, y1 + 29, 16, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+  const y2 = y1 + bh + 12;
+  chunkyCapsule(bx, y2, bw, bh, 23, '#ffffff', '#efe8ff', '#b89ae8');
+  outlinedText('NO THANKS', W / 2, y2 + 29, 15, '#7b3ff2', '#5b2be0', 'rgba(0,0,0,0)');
+  CX.restore();
+  G._consentBtns = [
+    { id: 'yes', x: bx, y: y1, w: bw, h: bh },
+    { id: 'no', x: bx, y: y2, w: bw, h: bh },
+  ];
+}
+
+function drawShop(dt) {
+  if (!G.shop) return;
+  CX.save();
+  CX.fillStyle = 'rgba(40,10,80,0.55)';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 56, 340), ch = 372;
+  const cx0 = W / 2 - cw / 2, cy0 = H * 0.46 - ch / 2;
+  CX.fillStyle = '#fff6ea';
+  rr(cx0, cy0, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = 'rgba(120,30,220,0.6)'; CX.shadowBlur = 22;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx0, cy0, cw, ch, 24); CX.stroke();
+  CX.restore();
+  drawRibbon(W / 2, cy0 + 4, Math.min(cw * 0.6, 190, cw - 140), 44, 'SHOP', 18);
+  const btns = [{ id: 'close', x: cx0 + cw - 32, y: cy0 + 32, r: 22 }];
+  CX.strokeStyle = '#b89ae8'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(cx0 + cw - 38, cy0 + 26); CX.lineTo(cx0 + cw - 26, cy0 + 38);
+  CX.moveTo(cx0 + cw - 26, cy0 + 26); CX.lineTo(cx0 + cw - 38, cy0 + 38);
+  CX.stroke();
+
+  function row(y, title, sub, btnLabel, btnCols, id, disabled, hero) {
+    if (hero && !disabled) {
+      CX.fillStyle = 'rgba(255,201,60,0.16)';
+      rr(cx0 + 16, y, cw - 32, 86, 16); CX.fill();
+      CX.strokeStyle = 'rgba(255,159,46,0.55)'; CX.lineWidth = 2;
+      rr(cx0 + 16, y, cw - 32, 86, 16); CX.stroke();
+      // corner tag
+      CX.save();
+      CX.translate(cx0 + 30, y + 2); CX.rotate(-0.09);
+      chunkyCapsule(-14, -10, 46, 20, 10, '#ffd23f', '#ff9f2e', '#a86200');
+      outlinedText('FREE', 9, 4.5, 11, '#ffffff', '#fff3cf', 'rgba(120,60,0,0.9)');
+      CX.restore();
+    } else {
+      CX.fillStyle = 'rgba(123,63,242,0.07)';
+      rr(cx0 + 16, y, cw - 32, 86, 16); CX.fill();
+    }
+    CX.textAlign = 'left';
+    CX.fillStyle = '#4a2b6b'; CX.font = fnt(800, 16);
+    CX.fillText(title, cx0 + 78, y + 34);
+    CX.fillStyle = '#8a6ab0'; CX.font = fnt(600, 12);
+    CX.fillText(sub, cx0 + 78, y + 55);
+    const bw = 86, bx = cx0 + cw - 32 - bw, by = y + 22;
+    CX.globalAlpha = disabled ? 0.45 : 1;
+    chunkyCapsule(bx, by, bw, 42, 21, btnCols[0], btnCols[1], btnCols[2]);
+    outlinedText(btnLabel, bx + bw / 2, by + 27, 14, '#ffffff', '#efe8ff', 'rgba(30,18,60,0.85)');
+    CX.globalAlpha = 1;
+    if (!disabled) btns.push({ id, x: bx, y: by, w: bw, h: 42 });
+    return y + 98;
+  }
+  let y = cy0 + 66;
+  // rewarded video
+  const left = adsLeftToday();
+  CX.save();
+  CX.fillStyle = '#ffd93d';
+  CX.beginPath(); CX.arc(cx0 + 46, y + 43, 21, 0, 7); CX.fill();
+  CX.fillStyle = '#7a4c00';
+  CX.beginPath();
+  CX.moveTo(cx0 + 40, y + 33); CX.lineTo(cx0 + 58, y + 43); CX.lineTo(cx0 + 40, y + 53);
+  CX.closePath(); CX.fill();
+  CX.restore();
+  y = row(y, 'COIN BOOST', '+' + ADS.reward + ' coins · ad · ' + left + '/' + ADS.perDay + ' today',
+    left ? 'WATCH' : 'DONE', ['#7ce75a', '#34b24a', '#166e2c'], 'ad', !left, true);
+  // fish food
+  CX.save();
+  CX.fillStyle = '#5ee7d4';
+  CX.beginPath(); CX.arc(cx0 + 46, y + 43, 20, 0, 7); CX.fill();
+  CX.fillStyle = '#0e6e60';
+  for (const [fx, fy] of [[-6, -4], [4, -7], [1, 4], [-3, 8], [8, 3]]) {
+    CX.beginPath(); CX.arc(cx0 + 46 + fx, y + 43 + fy, 2.6, 0, 7); CX.fill();
+  }
+  CX.restore();
+  y = row(y, 'FISH FOOD ×' + SHOP_FOOD.qty, 'You have ' + AQ.food + (AQ.food === 1 ? ' flake' : ' flakes'),
+    SHOP_FOOD.cost + 'c', ['#54d9e8', '#2a9fc0', '#17708c'], 'food', false);
+  // mystery egg
+  const full = AQ.fish.length >= 16;
+  CX.save();
+  CX.fillStyle = '#f4f6ff';
+  CX.beginPath(); CX.ellipse(cx0 + 46, y + 43, 15, 20, 0, 0, 7); CX.fill();
+  CX.fillStyle = '#c976ff';
+  for (const [fx, fy] of [[-5, -6], [6, 2], [-2, 9]]) {
+    CX.beginPath(); CX.arc(cx0 + 46 + fx, y + 43 + fy, 3, 0, 7); CX.fill();
+  }
+  CX.restore();
+  y = row(y, 'MYSTERY EGG', full ? 'Aquarium full (16)' : 'A random new fish!',
+    full ? 'FULL' : SHOP_EGG.cost + 'c', ['#c07bff', '#8f46e6', '#5c2aa0'], 'egg', full);
+  CX.restore();
+  G._shopBtns = { card: { x: cx0, y: cy0, w: cw, h: ch }, btns };
+}
+function shopTap(x, y) {
+  const S2 = G._shopBtns;
+  if (!S2) return;
+  for (const b of S2.btns) {
+    if (hitRect(b, x, y)) {
+      if (b.id === 'close') { G.shop = false; Aud.click(); }
+      else if (b.id === 'ad') startAd();
+      else if (b.id === 'food') {
+        if (spendCoins(SHOP_FOOD.cost)) {
+          coinSpendFx(SHOP_FOOD.cost);
+          AQ.food += SHOP_FOOD.qty; saveAq();
+          PFA.track('shop_purchase', { item: 'food5', cost: SHOP_FOOD.cost, balance: G.coins });
+          toast('+' + SHOP_FOOD.qty + ' fish food!', 2.0);
+          Aud.buy(); hapt(15);
+        } else { toast('Not enough coins — watch an ad!', 2.2); Aud.deny(); G.coinDeny = 0.4; }
+      } else if (b.id === 'egg') {
+        if (spendCoins(SHOP_EGG.cost)) {
+          coinSpendFx(SHOP_EGG.cost);
+          const f = newFish('egg');
+          AQ.fish.push(f); saveAq();
+          PFA.track('shop_purchase', { item: 'egg', cost: SHOP_EGG.cost, balance: G.coins });
+          PFA.track('fish_granted', { level: G.level, species: PFFish.speciesName(f),
+            rarity: PFFish.RARITY[PFFish.SPECIES[f.sp].rarity].name, source: 'egg', first: f.fresh ? 1 : 0 });
+          const rr2 = PFFish.RARITY[PFFish.SPECIES[f.sp].rarity];
+          toast(f.name + ' the ' + PFFish.speciesName(f) + ' hatched! · ' +
+            (f.fresh ? 'NEW ' : '') + rr2.name, 2.8);
+          Aud.win(); hapt(30);
+        } else { toast('Not enough coins — watch an ad!', 2.2); Aud.deny(); G.coinDeny = 0.4; }
+      }
+      return;
+    }
+  }
+  if (!hitRect(S2.card, x, y)) { G.shop = false; Aud.click(); }
+}
+
+/* ---------- settings ---------- */
+function drawTogglePill(x, y, on) {
+  const w = 54, h = 30;
+  CX.save();
+  if (on) chunkyCapsule(x, y, w, h, 15, '#7ce75a', '#34b24a', '#166e2c');
+  else chunkyCapsule(x, y, w, h, 15, '#e6e0f2', '#cdc4e4', '#9d8cc4');
+  const kx = on ? x + w - 15 : x + 15;
+  CX.fillStyle = '#ffffff';
+  CX.beginPath(); CX.arc(kx, y + h / 2, 11, 0, 7); CX.fill();
+  CX.strokeStyle = 'rgba(90,60,150,0.25)'; CX.lineWidth = 1.5;
+  CX.beginPath(); CX.arc(kx, y + h / 2, 11, 0, 7); CX.stroke();
+  CX.restore();
+}
+function drawSettings(dt) {
+  if (!G.settings) return;
+  CX.save();
+  CX.fillStyle = 'rgba(40,10,80,0.55)';
+  CX.fillRect(0, 0, W, H);
+  const rows = [
+    { id: 'music', label: 'MUSIC', on: Mus.on },
+    { id: 'sound', label: 'SOUND', on: Aud.on },
+    { id: 'haptics', label: 'VIBRATION', on: hapt.on },
+  ];
+  if (PFA.enabled) rows.push({ id: 'analytics', label: 'SHARE STATS', sub: 'Anonymous gameplay stats', on: PFA.consent() === 1 });
+  const links = [{ id: 'privacylink', label: 'PRIVACY POLICY' }];
+  if (PFAuth.available()) links.push({ id: 'account', label: 'ACCOUNT' });
+  const cw = Math.min(W - 56, 340);
+  const ch = 62 + rows.length * 54 + 4 + links.length * 44 + 34;
+  const cx0 = W / 2 - cw / 2;
+  const cy0 = Math.max(12, Math.min(H * 0.46 - ch / 2, H - 12 - ch));
+  CX.fillStyle = '#fff6ea';
+  rr(cx0, cy0, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = 'rgba(120,30,220,0.6)'; CX.shadowBlur = 22;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx0, cy0, cw, ch, 24); CX.stroke();
+  CX.restore();
+  // cap the ribbon so its wings never reach under the close X on narrow cards
+  drawRibbon(W / 2, cy0 + 4, Math.min(cw * 0.72, 210, cw - 140), 44, 'SETTINGS', 18);
+  const btns = [{ id: 'close', x: cx0 + cw - 32, y: cy0 + 32, r: 22 }];
+  CX.strokeStyle = '#b89ae8'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(cx0 + cw - 38, cy0 + 26); CX.lineTo(cx0 + cw - 26, cy0 + 38);
+  CX.moveTo(cx0 + cw - 26, cy0 + 26); CX.lineTo(cx0 + cw - 38, cy0 + 38);
+  CX.stroke();
+  let y = cy0 + 62;
+  for (const r of rows) {
+    CX.fillStyle = 'rgba(123,63,242,0.07)';
+    rr(cx0 + 16, y, cw - 32, 46, 14); CX.fill();
+    CX.textAlign = 'left';
+    CX.fillStyle = '#4a2b6b'; CX.font = fnt(800, 15);
+    CX.fillText(r.label, cx0 + 32, y + (r.sub ? 22 : 29));
+    if (r.sub) {
+      CX.fillStyle = '#8a6ab0'; CX.font = fnt(600, 10.5);
+      CX.fillText(r.sub, cx0 + 32, y + 37);
+    }
+    drawTogglePill(cx0 + cw - 32 - 54, y + 8, r.on);
+    btns.push({ id: r.id, x: cx0 + 16, y, w: cw - 32, h: 46 });
+    y += 54;
+  }
+  y += 4;
+  for (const l of links) {
+    CX.textAlign = 'left';
+    CX.fillStyle = '#7b3ff2'; CX.font = fnt(800, 13.5);
+    CX.fillText(l.label, cx0 + 32, y + 28);
+    CX.strokeStyle = '#b89ae8'; CX.lineWidth = 2.6; CX.lineCap = 'round';
+    CX.beginPath();
+    CX.moveTo(cx0 + cw - 40, y + 15); CX.lineTo(cx0 + cw - 32, y + 22); CX.lineTo(cx0 + cw - 40, y + 29);
+    CX.stroke();
+    btns.push({ id: l.id, x: cx0 + 16, y, w: cw - 32, h: 44 });
+    y += 50;
+  }
+  CX.fillStyle = '#b7a3d6'; CX.font = fnt(600, 11); CX.textAlign = 'center';
+  CX.fillText('Potion Fusion v' + VERSION, W / 2, cy0 + ch - 14);
+  CX.restore();
+  G._setBtns = { card: { x: cx0, y: cy0, w: cw, h: ch }, btns };
+}
+function settingsTap(x, y) {
+  const S = G._setBtns;
+  if (!S) return;
+  for (const b of S.btns) {
+    if (hitRect(b, x, y)) {
+      if (b.id === 'close') { G.settings = false; Aud.click(); }
+      else if (b.id === 'music') toggleMusic();
+      else if (b.id === 'sound') toggleSound();
+      else if (b.id === 'haptics') toggleHaptics();
+      else if (b.id === 'analytics') {
+        const on = PFA.consent() === 1;
+        PFA.setConsent(on ? 0 : 1);
+        toast(on ? 'Analytics turned off' : 'Analytics on — thanks for helping!', 2.0);
+        Aud.click();
+      } else if (b.id === 'privacylink') openExternal(PRIVACY_URL);
+      else if (b.id === 'account') { G.settings = false; G.account = true; Aud.click(); }
+      return;
+    }
+  }
+  if (!hitRect(S.card, x, y)) { G.settings = false; Aud.click(); }
+}
+function openExternal(url) {
+  try {
+    if (window.Android && Android.openUrl) { Android.openUrl(url); return; }
+  } catch (e) {}
+  try { window.open(url, '_blank'); } catch (e) { location.href = url; }
+}
+
+/* ---------- main menu ---------- */
+function levelIntroToasts(n) {
+  if (n === 1) toast('Fuse RED + YELLOW into ORANGE!', 3.2);
+  if (n === 2) toast('YELLOW + BLUE make GREEN', 2.6);
+  if (n === 3) toast('RED + BLUE make PURPLE', 2.6);
+  if (n === 14) toast('NEW COLOR — GREEN + BLUE fuse into TEAL!', 3.4);
+  if (n === 22) toast('NEW COLOR — PURPLE + RED make MAGENTA!', 3.4);
+  if (n === 30) toast('NEW COLOR — GREEN + YELLOW make LIME!', 3.4);
+}
+function menuStartPlay() {
+  G.phase = 'play';
+  G.sel = -1; G.hint = null; G.idleT = 0;
+  G.pop = G.view.flasks.map((f, i) => -i * 0.05);   // replay the intro bounce
+  G.lockT = 0.35 + G.view.flasks.length * 0.04;
+  Aud.buy(); hapt(12);
+  PFA.track('menu_play', { level: G.level });
+  if (!G.levelStarted) {                             // fresh attempt, not a resume
+    G.levelStarted = true;
+    G.levelT0 = Date.now();                          // menu time is not level time
+    PFA.track('level_start', { level: G.level, hard: G.hard ? 1 : 0, par: G.par });
+    levelIntroToasts(G.level);
+  }
+}
+function gotoMenu() {
+  G.phase = 'menu';
+  G.sel = -1; G.hint = null;
+  toasts.length = 0;
+  Aud.click();
+}
+function enterAfterGate() {
+  // post-sign-in/guest landing follows the boot rule: a brand-new player
+  // goes straight into level 1, everyone else gets the menu
+  initDailyGift();
+  if (G.level <= 1) {
+    G.phase = 'play';
+    if (!G.levelStarted) {
+      G.levelStarted = true;
+      PFA.track('level_start', { level: G.level, hard: G.hard ? 1 : 0, par: G.par });
+    }
+    levelIntroToasts(1);
+  } else G.phase = 'menu';
+}
+function openSettings(source) {
+  G.settings = true;
+  Aud.click();
+  PFA.track('settings_open', { source });
+}
+function drawShopTile(b) {
+  const press = 1 - (PRESS['shopTile'] || 0) * 0.12;
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  CX.save();
+  CX.translate(cx, cy); CX.scale(press, press); CX.translate(-cx, -cy);
+  CX.fillStyle = '#b89ae8';
+  rr(b.x, b.y + 3.5, b.w, b.h, 16); CX.fill();
+  const g = CX.createLinearGradient(0, b.y, 0, b.y + b.h);
+  g.addColorStop(0, '#ffd23f'); g.addColorStop(1, '#ff9f2e');
+  CX.fillStyle = g;
+  rr(b.x, b.y, b.w, b.h, 16); CX.fill();
+  CX.strokeStyle = 'rgba(255,255,255,0.8)'; CX.lineWidth = 2;
+  rr(b.x, b.y, b.w, b.h, 16); CX.stroke();
+  drawCoin(cx, cy - 3, 14);
+  const px2 = b.x + b.w - 12, py2 = b.y + b.h - 12.5;
+  CX.fillStyle = '#1f7c31';
+  CX.beginPath(); CX.arc(px2, py2 + 2, 10, 0, 7); CX.fill();
+  const pg = CX.createLinearGradient(0, py2 - 10, 0, py2 + 10);
+  pg.addColorStop(0, '#8df06c'); pg.addColorStop(1, '#38b04b');
+  CX.fillStyle = pg;
+  CX.beginPath(); CX.arc(px2, py2, 10, 0, 7); CX.fill();
+  CX.strokeStyle = '#ffffff'; CX.lineWidth = 2.6; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(px2 - 4.5, py2); CX.lineTo(px2 + 4.5, py2);
+  CX.moveTo(px2, py2 - 4.5); CX.lineTo(px2, py2 + 4.5);
+  CX.stroke();
+  CX.restore();
+}
+function drawMenu(dt) {
+  const cx = W / 2, x0 = colX0();
+  drawTitleBlock();
+  const btns = [];
+  // coins (info pill, taps into the shop)
+  const cp = coinPillPos();
+  chunkyCapsule(cp.x, cp.y, cp.w, cp.h, 21, '#ffffff', '#efe8ff', '#b89ae8');
+  drawCoin(cp.x + 24, cp.y + 21, 15);
+  const coinTxt = String(Math.round(G.coinShown));
+  const coinFs = coinTxt.length > 4 ? 17 : coinTxt.length > 3 ? 20 : 22;
+  outlinedText(coinTxt, cp.x + 46, cp.y + 29 - (22 - coinFs) * 0.35, coinFs, '#c47510', '#8a5200', 'rgba(0,0,0,0)', 'left');
+  btns.push({ id: 'coins', x: cp.x, y: cp.y, w: cp.w, h: cp.h });
+  // settings gear
+  const gb = { id: 'settings', shape: 'c', x: x0 + 31, y: 35, r: 17 };
+  drawRoundBtn(gb); btns.push(gb);
+  // PLAY — the one big call to action
+  const pw = Math.min(W - 120, 270), ph = 64, px = cx - pw / 2, py = H * 0.50;
+  const breathe = (1 + Math.sin(G.t * 2.4) * 0.018) * (1 - (PRESS['play'] || 0) * 0.08);
+  CX.save();
+  CX.translate(cx, py + ph / 2); CX.scale(breathe, breathe); CX.translate(-cx, -(py + ph / 2));
+  CX.save();
+  CX.shadowColor = '#3ddc84'; CX.shadowBlur = 22;
+  chunkyCapsule(px, py, pw, ph, ph / 2, '#7ce75a', '#34b24a', '#166e2c');
+  CX.restore();
+  outlinedText('PLAY', cx, py + 31, 23, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+  outlinedText('LEVEL ' + G.level, cx, py + 51, 12.5, '#d9ffdd', '#b5f0bd', 'rgba(10,70,26,0.85)');
+  if (G.hard) {
+    CX.save();
+    CX.translate(px + pw - 30, py + 2); CX.rotate(0.09);
+    chunkyCapsule(-26, -10, 52, 20, 10, '#ff5f7e', '#e8355f', '#8f1230');
+    outlinedText('HARD', 0, 4.5, 11, '#ffffff', '#ffd9e2', 'rgba(110,8,40,0.9)');
+    CX.restore();
+  }
+  CX.restore();
+  btns.push({ id: 'play', x: px, y: py, w: pw, h: ph });
+  // meta shortcuts
+  const ts = 64, gap = 18, ty = py + ph + 30;
+  const aqB = { id: 'aquarium', x: cx - ts - gap / 2, y: ty, w: ts, h: ts };
+  const shB = { id: 'shopTile', x: cx + gap / 2, y: ty, w: ts, h: ts };
+  drawAquariumTile(aqB);
+  drawShopTile(shB);
+  btns.push(aqB, shB);
+  CX.fillStyle = 'rgba(255,255,255,0.75)';
+  CX.font = fnt(700, 11); CX.textAlign = 'center';
+  CX.fillText('AQUARIUM', aqB.x + ts / 2, ty + ts + 18);
+  CX.fillText('SHOP', shB.x + ts / 2, ty + ts + 18);
+  CX.fillStyle = 'rgba(255,255,255,0.45)';
+  CX.font = fnt(600, 11);
+  CX.fillText('v' + VERSION, cx, H - 12);
+  G._menuBtns = btns;
+}
+function menuTap(x, y) {
+  for (const b of (G._menuBtns || [])) {
+    if (!hitRect(b, x, y)) continue;
+    PRESS[b.id] = 1;
+    if (b.id === 'play') menuStartPlay();
+    else if (b.id === 'aquarium') {
+      G.aquarium = true; toasts.length = 0; reapStarved(); swimInit(); AquaGL.show(); Aud.click(); hapt(8);
+      PFA.track('aquarium_open', { fish: AQ.fish.length, food: AQ.food, hungry: hungryCount(), source: 'menu' });
+    } else if (b.id === 'coins' || b.id === 'shopTile') {
+      G.shop = true; Aud.click();
+      PFA.track('shop_open', { source: 'menu' });
+    } else if (b.id === 'settings') openSettings('menu');
+    return;
+  }
+}
+
+/* ---------- sign-in screen & account panel ---------- */
+function drawProviderBtn(id, x, y, w, h, small) {
+  if (id === 'google') {
+    chunkyCapsule(x, y, w, h, h / 2, '#ffffff', '#eef0f6', '#c3c8dc');
+    const gx = x + 30, gy = y + h / 2 - 1, r = 10;
+    CX.save();
+    CX.lineWidth = 5; CX.lineCap = 'butt';
+    CX.strokeStyle = '#EA4335'; CX.beginPath(); CX.arc(gx, gy, r, -2.55, -0.75); CX.stroke();
+    CX.strokeStyle = '#FBBC05'; CX.beginPath(); CX.arc(gx, gy, r, 2.2, 3.6); CX.stroke();
+    CX.strokeStyle = '#34A853'; CX.beginPath(); CX.arc(gx, gy, r, 0.75, 2.25); CX.stroke();
+    CX.strokeStyle = '#4285F4'; CX.beginPath(); CX.arc(gx, gy, r, -0.35, 0.6); CX.stroke();
+    CX.fillStyle = '#4285F4'; CX.fillRect(gx - 1, gy - 2.5, r + 3.5, 5);
+    CX.restore();
+    CX.fillStyle = '#3c4043';
+    CX.font = fnt(700, small ? 14 : 16);
+    CX.textAlign = 'left';
+    CX.fillText('Continue with Google', x + 52, y + h / 2 + 5);
+  } else if (id === 'facebook') {
+    chunkyCapsule(x, y, w, h, h / 2, '#2b87ff', '#1877F2', '#0b4699');
+    CX.save();
+    CX.fillStyle = '#ffffff';
+    CX.beginPath(); CX.arc(x + 30, y + h / 2 - 1, 12, 0, 7); CX.fill();
+    CX.fillStyle = '#1877F2';
+    CX.font = fnt(800, 19); CX.textAlign = 'center';
+    CX.fillText('f', x + 31, y + h / 2 + 6);
+    CX.restore();
+    CX.fillStyle = '#ffffff';
+    CX.font = fnt(700, small ? 14 : 16);
+    CX.textAlign = 'left';
+    CX.fillText('Continue with Facebook', x + 52, y + h / 2 + 5);
+  } else { // guest
+    CX.save();
+    CX.fillStyle = 'rgba(255,255,255,0.14)';
+    rr(x, y, w, h, h / 2); CX.fill();
+    CX.strokeStyle = 'rgba(255,255,255,0.85)'; CX.lineWidth = 2;
+    rr(x, y, w, h, h / 2); CX.stroke();
+    CX.restore();
+    outlinedText('PLAY AS GUEST', x + w / 2, y + h / 2 + 6, 15, '#ffffff', '#e8e2ff', 'rgba(50,20,110,0.6)');
+  }
+}
+
+function drawTitleBlock() {
+  const cx = W / 2;
+  const bob = Math.sin(G.t * 2) * 4;
+  // The wordmark is a fixed-size stack, so it is placed relative to the flask
+  // rather than at a percentage of the screen: on a short phone the old
+  // percentages drove "POTION" up into the flask it sits under.
+  const fh = Math.min(112, H * 0.155), fw = fh * 0.75;
+  const fy = H * 0.10 + bob;
+  drawFlaskBody({ units: ['O', 'O', 'O'], order: null, done: false },
+    { x: cx - fw / 2, y: fy, w: fw, h: fh, kind: 'order' }, false, 0);
+  drawStar(cx + fw * 0.69, fy + fh * 0.09, 11, GOLD);
+  drawStar(cx - fw * 0.76, fy + fh * 0.89, 7, GOLD);
+  const t0 = Math.max(fy + fh + 44, H * 0.315);
+  outlinedText('POTION', cx, t0, 42, '#ffffff', '#efe8ff', 'rgba(60,20,140,0.9)');
+  outlinedText('FUSION', cx, t0 + 50, 46, '#ffe36a', '#ffb42e', 'rgba(120,60,0,0.92)');
+  CX.fillStyle = 'rgba(255,255,255,0.85)';
+  CX.font = fnt(600, 15); CX.textAlign = 'center';
+  CX.fillText('Pour · Fuse · Deliver', cx, t0 + 84);
+}
+
+function drawSignin(dt) {
+  const cx = W / 2;
+  drawTitleBlock();
+  const bw = Math.min(W - 76, 310), bh = 54, bx = cx - bw / 2;
+  const y0 = H * 0.50;
+  drawProviderBtn('google', bx, y0, bw, bh);
+  drawProviderBtn('facebook', bx, y0 + 68, bw, bh);
+  drawProviderBtn('guest', bx, y0 + 148, bw, 48);
+  CX.fillStyle = 'rgba(255,255,255,0.6)';
+  CX.font = fnt(600, 11); CX.textAlign = 'center';
+  CX.fillText('Sign in to keep your progress with your account.', cx, y0 + 222);
+  CX.fillText('Guest play works fully offline — anonymous stats only.', cx, y0 + 240);
+  G._signBtns = [
+    { id: 'google', x: bx, y: y0, w: bw, h: bh },
+    { id: 'facebook', x: bx, y: y0 + 68, w: bw, h: bh },
+    { id: 'guest', x: bx, y: y0 + 148, w: bw, h: 48 },
+  ];
+}
+
+function drawAccount(dt) {
+  if (!G.account) return;
+  CX.save();
+  CX.fillStyle = 'rgba(40,10,80,0.55)';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 64, 330), ch = 296;
+  const cx0 = W / 2 - cw / 2, cy0 = H * 0.44 - ch / 2;
+  CX.fillStyle = '#fff6ea';
+  rr(cx0, cy0, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = 'rgba(120,30,220,0.6)'; CX.shadowBlur = 22;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx0, cy0, cw, ch, 24); CX.stroke();
+  CX.restore();
+  drawRibbon(W / 2, cy0 + 4, Math.min(cw * 0.72, 220, cw - 140), 44, 'ACCOUNT', 18);
+  const btns = [{ id: 'close', x: cx0 + cw - 32, y: cy0 + 32, r: 22 }];
+  CX.save();
+  CX.strokeStyle = '#b89ae8'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(cx0 + cw - 38, cy0 + 26); CX.lineTo(cx0 + cw - 26, cy0 + 38);
+  CX.moveTo(cx0 + cw - 26, cy0 + 26); CX.lineTo(cx0 + cw - 38, cy0 + 38);
+  CX.stroke();
+  CX.restore();
+  const u = PFAuth.user();
+  if (PFAuth.signedIn() && u) {
+    CX.save();
+    CX.fillStyle = '#7b3ff2';
+    CX.beginPath(); CX.arc(W / 2, cy0 + 108, 30, 0, 7); CX.fill();
+    outlinedText((u.name || 'P').slice(0, 1).toUpperCase(), W / 2, cy0 + 119, 30, '#ffffff', '#efe8ff', 'rgba(0,0,0,0)');
+    CX.restore();
+    CX.fillStyle = '#4a2b6b';
+    CX.font = fnt(800, 19); CX.textAlign = 'center';
+    CX.fillText(String(u.name || 'Player').slice(0, 22), W / 2, cy0 + 168);
+    CX.fillStyle = '#8a6ab0';
+    CX.font = fnt(600, 13);
+    CX.fillText('via ' + (u.provider === 'facebook' ? 'Facebook' : u.provider === 'google' ? 'Google' : u.provider), W / 2, cy0 + 190);
+    const bw2 = cw - 90, bx2 = W / 2 - bw2 / 2, by2 = cy0 + ch - 66;
+    chunkyCapsule(bx2, by2, bw2, 48, 24, '#ff5f7e', '#e8355f', '#8f1230');
+    outlinedText('SIGN OUT', W / 2, by2 + 31, 16, '#ffffff', '#ffd9e2', 'rgba(110,8,40,0.95)');
+    btns.push({ id: 'signout', x: bx2, y: by2, w: bw2, h: 48 });
+  } else {
+    CX.fillStyle = '#4a2b6b';
+    CX.font = fnt(800, 17); CX.textAlign = 'center';
+    CX.fillText('Playing as Guest', W / 2, cy0 + 92);
+    const bw2 = cw - 60, bx2 = W / 2 - bw2 / 2;
+    drawProviderBtn('google', bx2, cy0 + 116, bw2, 50, true);
+    drawProviderBtn('facebook', bx2, cy0 + 178, bw2, 50, true);
+    btns.push({ id: 'google', x: bx2, y: cy0 + 116, w: bw2, h: 50 });
+    btns.push({ id: 'facebook', x: bx2, y: cy0 + 178, w: bw2, h: 50 });
+  }
+  CX.restore();
+  G._accBtns = { card: { x: cx0, y: cy0, w: cw, h: ch }, btns };
+}
+
+function hitRect(b, x, y) {
+  if (b.r) return (x - b.x) ** 2 + (y - b.y) ** 2 <= (b.r + 8) ** 2;
+  return x >= b.x - 4 && x <= b.x + b.w + 4 && y >= b.y - 4 && y <= b.y + b.h + 4;
+}
+
+function startProvider(provider) {
+  Aud.click(); hapt(10);
+  if (!PFAuth.signIn(provider)) toast('Open the app (or an http page) to sign in', 2.4);
+  else toast('Opening ' + (provider === 'google' ? 'Google' : 'Facebook') + ' sign-in…', 2.2);
+}
+
+/* ---------- aquarium screen ---------- */
+function updateAquarium(dt) {
+  swimInit();
+  for (let i = FLAKES.length - 1; i >= 0; i--) {
+    const fl = FLAKES[i];
+    fl.t += dt;
+    if (fl.y < H - 56) { fl.y += 26 * dt; fl.x += Math.sin(fl.t * 4) * 0.5; }
+    if (fl.t > 14) FLAKES.splice(i, 1);
+  }
+  for (const f of AQ.fish) {
+    const s = SWIM[f.id];
+    let target = null, best = 1e9;
+    for (const fl of FLAKES) {
+      const d = Math.abs(fl.x - s.x) + Math.abs(fl.y - s.y);
+      if (d < best) { best = d; target = fl; }
+    }
+    if (target) {
+      s.dir = target.x > s.x ? 1 : -1;
+      s.x += s.dir * 70 * dt;
+      s.y += (target.y - s.y) * Math.min(1, dt * 2.2);
+      if (Math.abs(target.x - s.x) < 12 && Math.abs(target.y - s.y) < 12) {
+        FLAKES.splice(FLAKES.indexOf(target), 1);
+        f.fed += 1; f.lastFed = Date.now(); recordBest(f); saveAq();
+        floatText(s.x, s.y - 24, 'nom!', '#ffe9a8', 13);
+        Aud.glug(1);
+      }
+    } else {
+      s.turnT -= dt;
+      if (s.turnT <= 0) { s.turnT = 2 + Math.random() * 5; if (Math.random() < 0.4) s.dir *= -1; }
+      s.x += s.dir * s.speed * dt;
+      s.y += Math.sin(G.t * 0.8 + s.wob) * 8 * dt;
+      if (s.x < 40) s.dir = 1;
+      if (s.x > W - 40) s.dir = -1;
+      s.y = Math.max(120, Math.min(H - 90, s.y));
+    }
+  }
+}
+
+function drawAquariumScene(dt) {
+  // water (canvas fallback when WebGL is unavailable)
+  const g = CX.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#3f9fe0'); g.addColorStop(0.6, '#1c64ad'); g.addColorStop(1, '#0b3f7a');
+  CX.fillStyle = g; CX.fillRect(0, 0, W, H);
+  // light rays
+  CX.save();
+  CX.globalAlpha = 0.08;
+  CX.fillStyle = '#ffffff';
+  for (let r = 0; r < 3; r++) {
+    const rx = W * (0.2 + r * 0.3) + Math.sin(G.t * 0.3 + r) * 20;
+    CX.beginPath();
+    CX.moveTo(rx - 20, 0); CX.lineTo(rx + 20, 0);
+    CX.lineTo(rx + 90, H); CX.lineTo(rx - 50, H);
+    CX.closePath(); CX.fill();
+  }
+  CX.restore();
+  // sand + plants
+  CX.fillStyle = '#e8cf9a';
+  CX.beginPath();
+  CX.moveTo(0, H - 44);
+  for (let x = 0; x <= W + 20; x += 20) CX.lineTo(x, H - 44 + Math.sin(x * 0.05) * 5);
+  CX.lineTo(W, H); CX.lineTo(0, H);
+  CX.closePath(); CX.fill();
+  CX.fillStyle = 'rgba(160,120,60,0.35)';
+  for (let x = 20; x < W; x += 47) { CX.beginPath(); CX.arc(x, H - 22 + (x % 13), 3.5, 0, 7); CX.fill(); }
+  for (let s = 0; s < 3; s++) {
+    const sx = W * (0.14 + s * 0.36), sw = Math.sin(G.t * 1.2 + s * 2) * 14;
+    CX.strokeStyle = s % 2 ? '#2fae6e' : '#1f8f58';
+    CX.lineWidth = 7; CX.lineCap = 'round';
+    CX.beginPath();
+    CX.moveTo(sx, H - 40);
+    CX.quadraticCurveTo(sx + sw * 0.4, H - 90, sx + sw, H - 140 - s * 16);
+    CX.stroke();
+  }
+  // bubbles
+  for (const b of bgDecor) {
+    if (b.star) continue;
+    CX.fillStyle = 'rgba(255,255,255,0.25)';
+    CX.beginPath(); CX.arc(b.x * W, b.y * H, b.r + 1, 0, 7); CX.fill();
+  }
+  // flakes
+  for (const fl of FLAKES) {
+    CX.fillStyle = '#ffe9a8';
+    CX.save();
+    CX.translate(fl.x, fl.y); CX.rotate(fl.t * 2);
+    CX.fillRect(-3, -2, 6, 4);
+    CX.restore();
+  }
+  // fish
+  for (const f of AQ.fish) {
+    const s = SWIM[f.id];
+    if (s) PFFish.draw(CX, f, s.x, s.y, G.t, s.dir, 1);
+  }
+}
+
+function drawAquariumUI(dt) {
+  if (!AQ.fish.length) {
+    CX.fillStyle = 'rgba(255,255,255,0.8)';
+    CX.font = fnt(600, 15); CX.textAlign = 'center';
+    CX.fillText('Complete level 1 to earn your first fish!', W / 2, H * 0.45);
+  }
+  const btns = [{ id: 'back', x: 36, y: 38, r: 22 }];
+  CX.fillStyle = 'rgba(10,40,80,0.6)';
+  CX.beginPath(); CX.arc(36, 38, 22, 0, 7); CX.fill();
+  CX.strokeStyle = '#ffffff'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(43, 29); CX.lineTo(28, 38); CX.lineTo(43, 47);
+  CX.stroke();
+  outlinedText(tankName(), W / 2, 42, 21, '#ffffff', '#d8ecff', 'rgba(8,40,90,0.9)');
+  // three stars + the beauty bar toward the next one: the whole chase, one line
+  const stars = tankStars(), goals = tankGoals(), beau = tankBeauty();
+  const nextGoal = stars < 3 ? goals[stars] : goals[2];
+  const prevGoal = stars === 0 ? 0 : goals[stars - 1];
+  const frac2 = stars >= 3 ? 1 : Math.max(0, Math.min(1, (beau - prevGoal) / Math.max(1, nextGoal - prevGoal)));
+  const pop = 1 + (G.starPop || 0) * 0.35;
+  for (let i = 0; i < 3; i++) {
+    const sx = W / 2 - 26 + i * 26, sy = 66;
+    CX.save();
+    if (i === stars - 1 && G.starPop) { CX.translate(sx, sy); CX.scale(pop, pop); CX.translate(-sx, -sy); }
+    if (i < stars) drawStar(sx, sy, 11, GOLD);
+    else {
+      CX.strokeStyle = 'rgba(255,255,255,0.45)'; CX.lineWidth = 2;
+      CX.beginPath(); CX.arc(sx, sy, 8, 0, 7); CX.stroke();
+    }
+    CX.restore();
+  }
+  const bbw = Math.min(W - 120, 210), bbx = W / 2 - bbw / 2;
+  CX.fillStyle = 'rgba(0,0,0,0.28)';
+  rr(bbx, 82, bbw, 12, 6); CX.fill();
+  CX.fillStyle = stars >= 3 ? GOLD : '#5ee7d4';
+  rr(bbx, 82, Math.max(12, bbw * frac2), 12, 6); CX.fill();
+  CX.fillStyle = '#ffffff'; CX.font = fnt(800, 9.5); CX.textAlign = 'center';
+  CX.fillText(stars >= 3 ? 'TANK COMPLETE' : beau + ' / ' + nextGoal + ' BEAUTY', W / 2, 91.5);
+  CX.fillStyle = 'rgba(255,255,255,0.7)';
+  CX.font = fnt(600, 11);
+  const nextFishLv = G.level % 5 === 0 ? G.level : G.level - (G.level % 5) + 5;
+  CX.fillText('FISH ' + AQ.fish.length + '/16' +
+    (AQ.fish.length < 16 ? '  ·  next at level ' + nextFishLv : ''), W / 2, 108);
+  // hunger warning: how long until the hungriest fish leaves
+  const hungryN = hungryCount();
+  if (hungryN && FISHCFG.lossOn) {
+    let soonest = Infinity;
+    for (const f of AQ.fish) soonest = Math.min(soonest, PFFish.hoursLeft(f, Date.now(), FISHCFG));
+    const hrs = Math.max(1, Math.round(soonest));
+    const urgent = soonest <= (FISHCFG.loseH - FISHCFG.starveH);
+    outlinedText('! ' + hungryN + (hungryN === 1 ? ' FISH IS HUNGRY' : ' FISH ARE HUNGRY') +
+      ' - FEED WITHIN ' + hrs + 'H', W / 2, 126, 12.5,
+      urgent ? '#ff8091' : '#ffe36a', urgent ? '#e8355f' : '#ffb42e', 'rgba(20,10,40,0.92)');
+  }
+  // food pill
+  const fp = { x: W - 116, y: 14, w: 100, h: 44 };
+  chunkyCapsule(fp.x, fp.y, fp.w, fp.h, 22, '#ffffff', '#e8f6ff', '#9fc4e8');
+  CX.fillStyle = '#5ee7d4';
+  CX.beginPath(); CX.arc(fp.x + 22, fp.y + 22, 10, 0, 7); CX.fill();
+  CX.fillStyle = '#0e6e60';
+  for (const [fx, fy] of [[-3, -2], [3, -3], [0, 3]]) { CX.beginPath(); CX.arc(fp.x + 22 + fx, fp.y + 22 + fy, 1.7, 0, 7); CX.fill(); }
+  outlinedText(String(AQ.food), fp.x + 40, fp.y + 29, 17, '#0e7a95', '#0a5f76', 'rgba(0,0,0,0)', 'left');
+  btns.push({ id: 'foodpill', x: fp.x, y: fp.y, w: fp.w, h: fp.h });
+  drawTankDecor();
+  if (!G.tankDone) syncTankStars();     // beauty can move without a purchase
+  // hunger bubbles above each hungry fish (works for both GL and canvas tanks)
+  for (const f of AQ.fish) {
+    const st = fishState(f), sw = SWIM[f.id];
+    if (st === 'fed' || !sw) continue;
+    const bx0 = sw.x, by0 = sw.y - PFFish.sizePx(f) * 0.55 - 20;
+    const pulse = 0.5 + 0.5 * Math.sin(G.t * (st === 'starving' ? 7 : 3.5));
+    CX.save();
+    CX.strokeStyle = 'rgba(255,255,255,' + (0.35 + pulse * 0.55).toFixed(2) + ')';
+    CX.lineWidth = 3;
+    CX.beginPath(); CX.arc(bx0, by0, 11.5, 0, 7); CX.stroke();
+    CX.fillStyle = st === 'starving' ? '#e8355f' : '#ffb42e';
+    CX.beginPath(); CX.arc(bx0, by0, 9.5, 0, 7); CX.fill();
+    CX.strokeStyle = 'rgba(30,10,50,0.55)'; CX.lineWidth = 1.5;
+    CX.beginPath(); CX.arc(bx0, by0, 9.5, 0, 7); CX.stroke();
+    CX.fillStyle = '#ffffff';
+    CX.font = fnt(800, 14); CX.textAlign = 'center';
+    CX.fillText('!', bx0, by0 + 5);
+    CX.restore();
+  }
+  // bottom bar: DECOR | FEED | ALBUM as one row with equal gutters. FEED used
+  // to be centred with a -24 nudge, which overlapped DECOR by 5px at every
+  // width; deriving all three from the same row keeps them from colliding.
+  const barPad = 14, barGap = 12, sideW = 62, barH = 54, barY = H - 76;
+  const dbX = barPad, abX = W - barPad - sideW;
+  const bx = dbX + sideW + barGap, bw = Math.max(90, abX - barGap - bx);
+  // album button (bottom-right, opposite the DECOR shelf)
+  const abW = sideW, abY = barY;
+  chunkyCapsule(abX, abY, abW, barH, 16, '#c07bff', '#8f46e6', '#5c2aa0');
+  CX.save();
+  CX.translate(abX + abW / 2, abY + 20);
+  CX.fillStyle = '#ffffff';
+  rr(-11, -9, 22, 18, 3); CX.fill();
+  CX.fillStyle = '#8f46e6';
+  rr(-8.5, -6.5, 7.5, 13, 2); CX.fill();
+  rr(1, -6.5, 7.5, 13, 2); CX.fill();
+  CX.restore();
+  CX.fillStyle = '#ffffff'; CX.font = fnt(800, 10); CX.textAlign = 'center';
+  CX.fillText('ALBUM', abX + abW / 2, abY + 45);
+  const seenN = AQ.seen.length;
+  if (seenN < PFFish.SPECIES.length) {
+    const bt = seenN + '/' + PFFish.SPECIES.length;
+    CX.font = fnt(800, 9.5);
+    const bw3 = CX.measureText(bt).width + 13, bh3 = 17;
+    const bx3 = abX + abW - bw3 + 5, by3 = abY - bh3 / 2;
+    chunkyCapsule(bx3, by3, bw3, bh3, bh3 / 2, '#ffffff', '#ece0ff', '#5c2aa0');
+    CX.fillStyle = '#5c2aa0'; CX.textAlign = 'center';
+    CX.fillText(bt, bx3 + bw3 / 2, by3 + 12);
+  }
+  btns.push({ id: 'album', x: abX, y: abY, w: abW, h: barH });
+  // feed button
+  const by = barY;
+  CX.globalAlpha = AQ.food > 0 ? 1 : 0.5;
+  CX.save();
+  CX.shadowColor = '#54d9e8'; CX.shadowBlur = 14;
+  chunkyCapsule(bx, by, bw, barH, 27, '#54d9e8', '#2a9fc0', '#17708c');
+  CX.restore();
+  outlinedText(AQ.food > 0 ? 'FEED  (1 food)' : 'GET FOOD', bx + bw / 2, by + 34, 17, '#ffffff', '#e2fbff', 'rgba(10,60,80,0.9)');
+  CX.globalAlpha = 1;
+  btns.push({ id: 'feed', x: bx, y: by, w: bw, h: barH });
+  // DECOR shop (bottom-left): where coins turn into a prettier tank
+  const dbW = sideW, dbY = barY;
+  chunkyCapsule(dbX, dbY, dbW, barH, 16, '#ffd23f', '#ff9f2e', '#a86200');
+  CX.save();
+  CX.translate(dbX + dbW / 2, dbY + 20);
+  CX.fillStyle = '#7a4c00';
+  CX.beginPath();                              // a little potted coral icon
+  CX.moveTo(-9, 8); CX.lineTo(9, 8); CX.lineTo(6, -1); CX.lineTo(-6, -1); CX.closePath(); CX.fill();
+  CX.strokeStyle = '#7a4c00'; CX.lineWidth = 2.6; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(0, -1); CX.lineTo(0, -9);
+  CX.moveTo(0, -6); CX.lineTo(-5, -11);
+  CX.moveTo(0, -6); CX.lineTo(5, -11);
+  CX.stroke();
+  CX.restore();
+  CX.fillStyle = '#7a4c00'; CX.font = fnt(800, 10); CX.textAlign = 'center';
+  CX.fillText('DECOR', dbX + dbW / 2, dbY + 45);
+  // nudge while anything is affordable and unbought
+  if (DECOR.some(d => !ownsDecor(d.id) && G.coins >= decorPrice(d))) {
+    CX.save();
+    CX.globalAlpha = 0.55 + 0.45 * Math.sin(G.t * 4);
+    CX.strokeStyle = '#fff3cf'; CX.lineWidth = 3;
+    rr(dbX - 3, dbY - 3, dbW + 6, barH + 6, 18); CX.stroke();
+    CX.restore();
+  }
+  btns.push({ id: 'decor', x: dbX, y: dbY, w: dbW, h: barH });
+  G._aqBtns = btns;
+}
+
+function drawFishDetail(dt) {
+  if (!G.fishDetail) return;
+  const f = AQ.fish.find(x => x.id === G.fishDetail);
+  if (!f) { G.fishDetail = null; return; }
+  CX.save();
+  CX.fillStyle = 'rgba(6,30,60,0.6)';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 60, 330), ch = 366;
+  const cx0 = W / 2 - cw / 2, cy0 = H * 0.44 - ch / 2;
+  CX.fillStyle = '#fff6ea';
+  rr(cx0, cy0, cw, ch, 24); CX.fill();
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx0, cy0, cw, ch, 24); CX.stroke();
+  const btns = [{ id: 'close', x: cx0 + cw - 32, y: cy0 + 32, r: 22 }];
+  CX.strokeStyle = '#b89ae8'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(cx0 + cw - 38, cy0 + 26); CX.lineTo(cx0 + cw - 26, cy0 + 38);
+  CX.moveTo(cx0 + cw - 26, cy0 + 26); CX.lineTo(cx0 + cw - 38, cy0 + 38);
+  CX.stroke();
+  // swatch of water behind the star of the show
+  CX.save();
+  rr(cx0 + 20, cy0 + 20, cw - 40, 110, 16);
+  CX.clip();
+  const wg = CX.createLinearGradient(0, cy0 + 20, 0, cy0 + 130);
+  wg.addColorStop(0, '#3f9fe0'); wg.addColorStop(1, '#1c64ad');
+  CX.fillStyle = wg;
+  CX.fillRect(cx0 + 20, cy0 + 20, cw - 40, 110);
+  PFFish.draw(CX, f, W / 2, cy0 + 76, G.t, 1, Math.min(2.8, 64 / PFFish.sizePx(f)));
+  CX.restore();
+  CX.textAlign = 'center';
+  CX.fillStyle = '#4a2b6b'; CX.font = fnt(800, 21);
+  CX.fillText(f.name, W / 2, cy0 + 158);
+  CX.fillStyle = '#8a6ab0'; CX.font = fnt(600, 13);
+  CX.fillText(PFFish.speciesName(f) + ' · from level ' + f.level, W / 2, cy0 + 178);
+  // rarity chip
+  const rar = PFFish.RARITY[PFFish.SPECIES[f.sp].rarity];
+  CX.font = fnt(800, 10.5);
+  const rw = CX.measureText(rar.name).width + 22;
+  CX.fillStyle = rar.col;
+  rr(W / 2 - rw / 2, cy0 + 188, rw, 18, 9); CX.fill();
+  CX.fillStyle = '#10233d'; CX.textAlign = 'center';
+  CX.fillText(rar.name, W / 2, cy0 + 200);
+  // size + growth bar
+  const frac = PFFish.growthFrac(f.fed, PFFish.SPECIES[f.sp]);
+  CX.fillStyle = '#4a2b6b'; CX.font = fnt(800, 15);
+  CX.fillText('SIZE  ' + PFFish.sizeCm(f) + ' cm', W / 2, cy0 + 228);
+  const gw = cw - 80, gx0 = W / 2 - gw / 2, gy0 = cy0 + 238;
+  CX.fillStyle = 'rgba(123,63,242,0.15)';
+  rr(gx0, gy0, gw, 12, 6); CX.fill();
+  CX.fillStyle = frac >= 0.99 ? '#3ddc84' : '#c976ff';
+  rr(gx0, gy0, Math.max(12, gw * frac), 12, 6); CX.fill();
+  CX.fillStyle = '#8a6ab0'; CX.font = fnt(600, 11);
+  CX.fillText(frac >= 0.99 ? 'FULLY GROWN' : Math.round(frac * 100) + '% grown · ate ' + f.fed + (f.fed === 1 ? ' flake' : ' flakes'), W / 2, cy0 + 266);
+  // hunger clock
+  const hst = fishState(f);
+  const hleft = Math.max(1, Math.round(PFFish.hoursLeft(f, Date.now(), FISHCFG)));
+  CX.font = fnt(800, 11.5);
+  CX.fillStyle = hst === 'fed' ? '#2a9f6a' : hst === 'hungry' ? '#c47510' : '#e8355f';
+  CX.fillText(!FISHCFG.lossOn ? 'WELL FED'
+    : hst === 'fed' ? 'WELL FED'
+    : hst === 'hungry' ? '⚠ HUNGRY · leaves in ' + hleft + 'h'
+    : '⚠ STARVING · leaves in ' + hleft + 'h', W / 2, cy0 + 286);
+  // rename
+  const bw2 = cw - 110, bx2 = W / 2 - bw2 / 2, by2 = cy0 + ch - 58;
+  chunkyCapsule(bx2, by2, bw2, 46, 23, '#c07bff', '#8f46e6', '#5c2aa0');
+  outlinedText('RENAME', W / 2, by2 + 30, 15, '#ffffff', '#efe8ff', 'rgba(30,18,60,0.85)');
+  btns.push({ id: 'rename', x: bx2, y: by2, w: bw2, h: 46 });
+  CX.restore();
+  G._fdBtns = { card: { x: cx0, y: cy0, w: cw, h: ch }, btns, fish: f };
+}
+
+/* ---------- fish album: the collection, sorted by type ----------
+ * A scrollable two-column shelf of big portrait cards. Drag to scroll
+ * (with a little inertia); a tap that did not drag opens the card. */
+function albumEntries() {
+  return PFFish.SPECIES.map((sp, i) => {
+    let owned = 0, best = null;
+    for (const f of AQ.fish) if (f.sp === i) { owned++; if (!best || f.fed > best.fed) best = f; }
+    return { i, sp, owned, best, record: AQ.best[i] || 0, seen: AQ.seen.indexOf(i) >= 0 };
+  }).sort((a, b) => a.sp.rarity - b.sp.rarity || a.sp.name.localeCompare(b.sp.name));
+}
+const ALB = { scroll: 0, max: 0, vel: 0, drag: null, cards: [] };
+const DEC = { scroll: 0, max: 0, vel: 0, drag: null, cards: [] };
+const TEXT_H = 84;                  // name + detail lines + growth bar
+function albumLayout() {
+  const cols = W < 300 ? 1 : 2;   // 320px phones still get two columns
+  const pad = 14, gap = 12;
+  const cw = (Math.min(W, 460) - pad * 2 - gap * (cols - 1)) / cols;
+  // height follows the text block (name + 2 detail lines + growth bar), so
+  // nothing overflows on narrow cards
+  const ch = Math.round(cw * 0.66) + TEXT_H;
+  return { cols, pad, gap, cw, ch, x0: (W - Math.min(W, 460)) / 2 + pad, top: 104 };
+}
+function drawAlbumCard(e, x, y, w, h) {
+  const rar = PFFish.RARITY[e.sp.rarity];
+  const portH = h - TEXT_H;
+  CX.save();
+  // card body
+  CX.fillStyle = e.seen ? 'rgba(255,255,255,0.09)' : 'rgba(255,255,255,0.035)';
+  rr(x, y, w, h, 18); CX.fill();
+  // portrait window: a slice of tank water
+  CX.save();
+  rr(x + 6, y + 6, w - 12, portH, 14); CX.clip();
+  const wg = CX.createLinearGradient(0, y, 0, y + portH);
+  if (e.seen) { wg.addColorStop(0, '#3f9fe0'); wg.addColorStop(1, '#12508f'); }
+  else { wg.addColorStop(0, '#16263f'); wg.addColorStop(1, '#0d1a2c'); }
+  CX.fillStyle = wg;
+  CX.fillRect(x + 6, y + 6, w - 12, portH);
+  // god ray + bubbles for a bit of life
+  CX.globalAlpha = e.seen ? 0.14 : 0.06;
+  CX.fillStyle = '#ffffff';
+  CX.beginPath();
+  CX.moveTo(x + w * 0.30, y + 6); CX.lineTo(x + w * 0.46, y + 6);
+  CX.lineTo(x + w * 0.62, y + 6 + portH); CX.lineTo(x + w * 0.34, y + 6 + portH);
+  CX.closePath(); CX.fill();
+  CX.globalAlpha = e.seen ? 0.35 : 0.12;
+  for (let b = 0; b < 3; b++) {
+    const bx = x + 18 + ((b * 37 + e.i * 13) % (w - 36));
+    const by = y + 6 + portH - ((G.t * 14 + b * 40 + e.i * 20) % portH);
+    CX.beginPath(); CX.arc(bx, by, 1.8 + b * 0.6, 0, 7); CX.fill();
+  }
+  CX.globalAlpha = 1;
+  // the fish itself, big
+  const fx = x + w / 2 + w * 0.07, fy = y + 6 + portH * 0.52 + Math.sin(G.t * 1.5 + e.i) * 3;
+  const model = e.seen && e.best ? e.best
+    : { sp: e.i, c1: e.seen ? '#8fa8c8' : '#1e3350', c2: e.seen ? '#7891b4' : '#182942',
+        pat: 0, fed: e.sp.k * 0.9, ph: e.i, lastFed: 0 };
+  // the renderer draws the tail beyond the body length, so budget for it
+  const sc = Math.min(1.9, (w - 70) / PFFish.sizePx({ sp: e.i, fed: model.fed }));
+  CX.save();
+  if (e.seen && !e.best) CX.globalAlpha = 0.5;      // discovered, none in tank
+  PFFish.draw(CX, model, fx, fy, G.t, 1, sc);
+  CX.restore();
+  if (!e.seen) {
+    CX.fillStyle = 'rgba(255,255,255,0.5)';
+    CX.font = fnt(800, 40); CX.textAlign = 'center';
+    CX.fillText('?', fx, fy + 14);
+  }
+  CX.restore();
+  // rarity ribbon across the portrait's bottom edge
+  CX.fillStyle = e.seen ? rar.col : 'rgba(255,255,255,0.20)';
+  rr(x + 6, y + portH - 12, w - 12, 20, 8); CX.fill();
+  CX.fillStyle = e.seen ? '#10233d' : 'rgba(255,255,255,0.55)';
+  CX.font = fnt(800, 10); CX.textAlign = 'center';
+  CX.fillText(rar.name, x + w / 2, y + portH + 2);
+  // name
+  CX.textAlign = 'center';
+  CX.fillStyle = e.seen ? '#ffffff' : 'rgba(255,255,255,0.42)';
+  CX.font = fnt(800, 16);
+  CX.fillText(e.seen ? e.sp.name : '? ? ?', x + w / 2, y + portH + 30);
+  // detail lines
+  const ly = y + portH + 48;
+  CX.font = fnt(700, 11);
+  if (!e.seen) {
+    CX.fillStyle = 'rgba(255,255,255,0.42)';
+    CX.fillText('UNDISCOVERED', x + w / 2, ly);
+    CX.font = fnt(600, 10.5);
+    CX.fillStyle = 'rgba(255,255,255,0.3)';
+    CX.fillText('Play on to find one', x + w / 2, ly + 15);
+  } else {
+    // in-tank count + personal record
+    CX.fillStyle = e.owned ? '#5ee7d4' : 'rgba(255,255,255,0.4)';
+    CX.fillText(e.owned ? 'IN TANK  x' + e.owned : 'NONE IN TANK', x + w / 2, ly);
+    CX.fillStyle = 'rgba(255,255,255,0.62)';
+    CX.font = fnt(600, 10.5);
+    const rec = e.record || (e.best ? PFFish.sizeCm(e.best) : 0);
+    CX.fillText('BEST ' + rec.toFixed(1) + ' cm  ·  UP TO ' + e.sp.maxCm + ' cm', x + w / 2, ly + 15);
+    // growth bar of the best specimen
+    if (e.best) {
+      const gw = w - 40, gx = x + 20, gy = ly + 24;
+      const fr = PFFish.frac(e.best);
+      CX.fillStyle = 'rgba(255,255,255,0.14)';
+      rr(gx, gy, gw, 6, 3); CX.fill();
+      CX.fillStyle = PFFish.isAdult(e.best) ? '#3ddc84' : '#ffc93c';
+      rr(gx, gy, Math.max(6, gw * fr), 6, 3); CX.fill();
+    }
+  }
+  // fully-grown rosette
+  if (e.seen && e.best && PFFish.isAdult(e.best)) {
+    CX.save();
+    CX.shadowColor = GOLD; CX.shadowBlur = 10;
+    drawStar(x + w - 20, y + 20, 10, GOLD);
+    CX.restore();
+  }
+  // border last so it sits above the portrait
+  CX.strokeStyle = e.seen ? rar.col : 'rgba(255,255,255,0.13)';
+  CX.lineWidth = e.seen ? 2.4 : 1.4;
+  rr(x, y, w, h, 18); CX.stroke();
+  CX.restore();
+}
+function drawAlbum(dt) {
+  if (!G.album) return;
+  const L = albumLayout();
+  const entries = albumEntries();
+  const found = entries.filter(e => e.seen).length;
+  const rows = Math.ceil(entries.length / L.cols);
+  const viewTop = L.top, viewH = H - viewTop - 12;
+  ALB.max = Math.max(0, rows * L.ch + (rows - 1) * L.gap - viewH + 10);
+  scrStep(ALB, dt);
+
+  CX.save();
+  CX.fillStyle = 'rgba(6,22,46,0.95)';
+  CX.fillRect(0, 0, W, H);
+  // cards, clipped to the scroll viewport
+  CX.save();
+  CX.beginPath(); CX.rect(0, viewTop, W, viewH); CX.clip();
+  ALB.cards = [];
+  entries.forEach((e, n) => {
+    const cx0 = L.x0 + (n % L.cols) * (L.cw + L.gap);
+    const cy0 = viewTop + Math.floor(n / L.cols) * (L.ch + L.gap) - ALB.scroll;
+    if (cy0 > H || cy0 + L.ch < viewTop) return;          // offscreen
+    drawAlbumCard(e, cx0, cy0, L.cw, L.ch);
+    ALB.cards.push({ id: e.i, x: cx0, y: cy0, w: L.cw, h: L.ch });
+  });
+  CX.restore();
+  // header over the shelf
+  const hg = CX.createLinearGradient(0, 0, 0, viewTop);
+  hg.addColorStop(0, 'rgba(6,22,46,1)'); hg.addColorStop(1, 'rgba(6,22,46,0.92)');
+  CX.fillStyle = hg;
+  CX.fillRect(0, 0, W, viewTop);
+  outlinedText('FISH ALBUM', W / 2, 46, 24, '#ffffff', '#d8ecff', 'rgba(8,40,90,0.9)');
+  CX.fillStyle = 'rgba(255,255,255,0.82)';
+  CX.font = fnt(700, 13); CX.textAlign = 'center';
+  CX.fillText(found + ' of ' + entries.length + ' species discovered', W / 2, 68);
+  const bw = Math.min(W - 80, 240), bx = W / 2 - bw / 2;
+  CX.fillStyle = 'rgba(255,255,255,0.16)';
+  rr(bx, 78, bw, 8, 4); CX.fill();
+  CX.fillStyle = found === entries.length ? GOLD : '#5ee7d4';
+  rr(bx, 78, Math.max(8, bw * found / entries.length), 8, 4); CX.fill();
+  // close X
+  const colW = Math.min(W, 460);
+  const cbx = (W - colW) / 2 + colW - 28;
+  CX.strokeStyle = 'rgba(255,255,255,0.85)'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(cbx - 6, 40); CX.lineTo(cbx + 6, 52);
+  CX.moveTo(cbx + 6, 40); CX.lineTo(cbx - 6, 52);
+  CX.stroke();
+  // bottom fade: the cut-off row reads as more content, not a glitch
+  if (ALB.scroll < ALB.max - 2) {
+    const fg = CX.createLinearGradient(0, H - 54, 0, H);
+    fg.addColorStop(0, 'rgba(6,22,46,0)'); fg.addColorStop(1, 'rgba(6,22,46,0.96)');
+    CX.fillStyle = fg;
+    CX.fillRect(0, H - 54, W, 54);
+  }
+  // scroll indicator
+  if (ALB.max > 4) {
+    const tr = viewH - 8, th = Math.max(30, tr * viewH / (viewH + ALB.max));
+    const ty = viewTop + 4 + (tr - th) * (ALB.scroll / ALB.max);
+    CX.fillStyle = 'rgba(255,255,255,0.10)';
+    rr(W - 8, viewTop + 4, 4, tr, 2); CX.fill();
+    CX.fillStyle = 'rgba(255,255,255,0.42)';
+    rr(W - 8, ty, 4, th, 2); CX.fill();
+    // "more below" nudge until the player scrolls
+    if (ALB.scroll < 6) {
+      CX.globalAlpha = 0.35 + 0.25 * Math.sin(G.t * 3);
+      CX.fillStyle = '#ffffff';
+      CX.font = fnt(700, 11); CX.textAlign = 'center';
+      CX.fillText('swipe for more', W / 2, H - 8);
+      CX.globalAlpha = 1;
+    }
+  }
+  CX.restore();
+  G._albBtns = [{ id: 'close', x: cbx, y: 46, r: 22 }];
+}
+/* Shared shelf input: pointerdown starts a drag, pointerup taps only if the
+   finger stayed put — so scrolling never fires a card or a BUY button. */
+function scrDown(S, x, y) {
+  S.drag = { y0: y, sy: S.scroll, last: y, lastT: G.t, moved: 0 };
+  S.vel = 0;
+}
+function scrMove(S, x, y) {
+  const d = S.drag;
+  if (!d) return;
+  const dy = y - d.y0;
+  d.moved = Math.max(d.moved, Math.abs(dy));
+  S.scroll = Math.max(0, Math.min(S.max, d.sy - dy));
+  const dt2 = Math.max(0.001, G.t - d.lastT);
+  S.vel = -(y - d.last) / dt2;
+  d.last = y; d.lastT = G.t;
+}
+function scrUp(S, x, y, onTap) {
+  const d = S.drag;
+  S.drag = null;
+  if (!d) return;
+  if (d.moved > 8) return;                       // that was a scroll
+  S.vel = 0;
+  onTap(x, y);
+}
+function scrStep(S, dt) {                        // inertia + clamp, per frame
+  if (!S.drag) {
+    if (Math.abs(S.vel) > 1) { S.scroll += S.vel * dt; S.vel *= Math.pow(0.002, dt); }
+    else S.vel = 0;
+  }
+  S.scroll = Math.max(0, Math.min(S.max, S.scroll));
+}
+// the shelf a drag currently belongs to (decor sits above the album)
+function activeShelf() {
+  if (G.fishDetail || G.tankDone) return null;
+  if (G.decorShop) return DEC;
+  if (G.album) return ALB;
+  return null;
+}
+function albumTap(x, y) {
+  for (const b of (G._albBtns || [])) {
+    if (hitRect(b, x, y)) { G.album = false; Aud.click(); return; }
+  }
+  // tapping a card you own opens that fish's detail page
+  for (const c of ALB.cards) {
+    if (x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) {
+      let best = null;
+      for (const f of AQ.fish) if (f.sp === c.id && (!best || f.fed > best.fed)) best = f;
+      if (best) { G.fishDetail = best.id; Aud.buy(); hapt(8); }
+      else Aud.click();
+      return;
+    }
+  }
+  if (y < 96) return;                            // header taps do nothing
+  G.album = false; Aud.click();                  // tap off the shelf closes
+}
+
+/* ---------- ornaments: parametric, no assets, drawn over either tank ------ */
+function drawOrnament(id, x, base, sc) {
+  CX.save();
+  CX.translate(x, base);
+  CX.scale(sc, sc);
+  const sway = Math.sin(G.t * 1.1 + x * 0.03) * 0.04;
+  if (id === 'weed') {
+    CX.strokeStyle = '#2fae6e'; CX.lineWidth = 6; CX.lineCap = 'round';
+    for (let i = -1; i <= 1; i++) {
+      CX.beginPath(); CX.moveTo(i * 9, 0);
+      CX.quadraticCurveTo(i * 9 + Math.sin(G.t * 1.4 + i) * 8, -26, i * 7 + Math.sin(G.t * 1.4 + i) * 12, -52);
+      CX.stroke();
+    }
+  } else if (id === 'rock') {
+    CX.fillStyle = '#5d6f88';
+    CX.beginPath(); CX.ellipse(0, -8, 24, 14, 0, 0, 7); CX.fill();
+    CX.fillStyle = '#748aa6';
+    CX.beginPath(); CX.ellipse(-6, -22, 14, 10, 0.2, 0, 7); CX.fill();
+    CX.fillStyle = '#8ea4bf';
+    CX.beginPath(); CX.ellipse(6, -34, 9, 7, -0.2, 0, 7); CX.fill();
+  } else if (id === 'coral') {
+    CX.rotate(sway);
+    for (const [dx, col, h] of [[-14, '#ff7ab8', 40], [0, '#ff5f7e', 56], [14, '#ffb36b', 44]]) {
+      CX.strokeStyle = col; CX.lineWidth = 7; CX.lineCap = 'round';
+      CX.beginPath(); CX.moveTo(dx, 0); CX.lineTo(dx, -h); CX.stroke();
+      CX.beginPath(); CX.moveTo(dx, -h * 0.6); CX.lineTo(dx + (dx ? 10 : -10), -h * 0.9); CX.stroke();
+    }
+  } else if (id === 'shell') {
+    CX.fillStyle = '#f0d7ef';
+    CX.beginPath(); CX.ellipse(0, -10, 26, 20, 0, Math.PI, 0); CX.fill();
+    CX.fillStyle = '#d9a8d6';
+    CX.beginPath(); CX.ellipse(0, -8, 26, 8, 0, 0, 7); CX.fill();
+    CX.strokeStyle = '#c98fc6'; CX.lineWidth = 2;
+    for (let i = -2; i <= 2; i++) {
+      CX.beginPath(); CX.moveTo(0, -9); CX.lineTo(i * 11, -27); CX.stroke();
+    }
+    CX.fillStyle = '#fff6ea';
+    CX.beginPath(); CX.arc(0, -14, 4.5, 0, 7); CX.fill();
+  } else if (id === 'ring') {
+    CX.strokeStyle = 'rgba(190,240,255,0.85)'; CX.lineWidth = 4;
+    CX.beginPath(); CX.arc(0, -20, 22, 0, 7); CX.stroke();
+    for (let i = 0; i < 7; i++) {
+      const a = G.t * 1.1 + i * 0.9;
+      CX.fillStyle = 'rgba(255,255,255,0.75)';
+      CX.beginPath(); CX.arc(Math.cos(a) * 22, -20 + Math.sin(a) * 22, 3.2, 0, 7); CX.fill();
+    }
+  } else if (id === 'amphora') {
+    CX.fillStyle = '#c98a4b';
+    CX.beginPath();
+    CX.moveTo(-12, 0); CX.quadraticCurveTo(-22, -26, -8, -40);
+    CX.lineTo(8, -40); CX.quadraticCurveTo(22, -26, 12, 0);
+    CX.closePath(); CX.fill();
+    CX.strokeStyle = '#a86f38'; CX.lineWidth = 4;
+    CX.beginPath(); CX.arc(-12, -34, 7, -1.2, 1.6); CX.stroke();
+    CX.beginPath(); CX.arc(12, -34, 7, 1.6, 4.3); CX.stroke();
+    CX.fillStyle = '#e8b071';
+    CX.fillRect(-9, -48, 18, 9);
+  } else if (id === 'lantern') {
+    // a drifting deep-sea lamp: glass globe, brass caps, soft light beams
+    CX.rotate(sway * 1.6);
+    CX.save();
+    CX.globalAlpha = 0.16 + 0.06 * Math.sin(G.t * 2);
+    CX.fillStyle = '#ffe9a8';
+    CX.beginPath();
+    CX.moveTo(-6, -18); CX.lineTo(6, -18); CX.lineTo(26, 34); CX.lineTo(-26, 34);
+    CX.closePath(); CX.fill();
+    CX.restore();
+    CX.save();
+    CX.shadowColor = '#ffd93d'; CX.shadowBlur = 20 + Math.sin(G.t * 2) * 7;
+    const lg = CX.createRadialGradient(-4, -22, 1, 0, -18, 15);
+    lg.addColorStop(0, '#fffbe8'); lg.addColorStop(1, '#ffc93c');
+    CX.fillStyle = lg;
+    CX.beginPath(); CX.arc(0, -18, 13, 0, 7); CX.fill();
+    CX.restore();
+    CX.fillStyle = '#b98a4a';
+    rr(-9, -34, 18, 7, 3); CX.fill();
+    rr(-7, -7, 14, 6, 3); CX.fill();
+    CX.strokeStyle = '#8a5a2b'; CX.lineWidth = 2.4; CX.lineCap = 'round';
+    CX.beginPath(); CX.arc(0, -38, 6, Math.PI, 0); CX.stroke();
+  } else if (id === 'column') {
+    CX.fillStyle = '#e7e0cf';
+    CX.fillRect(-16, -8, 32, 8);
+    CX.fillRect(-12, -62, 24, 54);
+    CX.strokeStyle = '#c8bfa8'; CX.lineWidth = 2;
+    for (let i = -1; i <= 1; i++) { CX.beginPath(); CX.moveTo(i * 7, -60); CX.lineTo(i * 7, -10); CX.stroke(); }
+    CX.fillStyle = '#d6cdb8';
+    CX.beginPath();
+    CX.moveTo(-16, -62); CX.lineTo(16, -62); CX.lineTo(10, -72); CX.lineTo(-8, -70); CX.closePath(); CX.fill();
+  } else if (id === 'chest') {
+    CX.fillStyle = '#8a5a2b'; rr(-26, -22, 52, 24, 5); CX.fill();
+    CX.fillStyle = '#a86f38'; rr(-26, -36, 52, 16, 7); CX.fill();
+    CX.strokeStyle = '#ffd93d'; CX.lineWidth = 3;
+    CX.beginPath(); CX.moveTo(-26, -20); CX.lineTo(26, -20); CX.stroke();
+    CX.fillStyle = '#ffd93d'; rr(-5, -26, 10, 11, 2); CX.fill();
+    drawCoin(-14, -42 + Math.sin(G.t * 2) * 2, 6);
+    drawCoin(13, -40 + Math.sin(G.t * 2 + 1.6) * 2, 5);
+  } else if (id === 'ship') {
+    CX.rotate(-0.08);
+    CX.fillStyle = '#7a5334';
+    CX.beginPath();
+    CX.moveTo(-52, -14); CX.lineTo(52, -14);
+    CX.quadraticCurveTo(40, 8, -30, 6);
+    CX.closePath(); CX.fill();
+    CX.fillStyle = '#93663f';
+    CX.fillRect(-52, -22, 104, 9);
+    CX.strokeStyle = '#6a4326'; CX.lineWidth = 4;
+    CX.beginPath(); CX.moveTo(4, -22); CX.lineTo(10, -74); CX.stroke();
+    CX.fillStyle = 'rgba(240,230,210,0.85)';
+    CX.beginPath();
+    CX.moveTo(10, -70); CX.quadraticCurveTo(44, -54, 12, -34); CX.closePath(); CX.fill();
+  } else if (id === 'arch') {
+    CX.strokeStyle = '#ff7ab8'; CX.lineWidth = 13; CX.lineCap = 'round';
+    CX.beginPath(); CX.arc(0, 0, 46, Math.PI, 0); CX.stroke();
+    CX.strokeStyle = '#5ee7d4'; CX.lineWidth = 6;
+    CX.beginPath(); CX.arc(0, 0, 46, Math.PI + 0.3, Math.PI + 1.0); CX.stroke();
+    CX.beginPath(); CX.arc(0, 0, 46, -1.0, -0.3); CX.stroke();
+    CX.fillStyle = '#ffb36b';
+    for (const a of [-2.6, -1.9, -1.2, -0.5]) {
+      CX.beginPath(); CX.arc(Math.cos(a) * 46, Math.sin(a) * 46, 6, 0, 7); CX.fill();
+    }
+  } else if (id === 'statue') {
+    CX.fillStyle = '#b9c6d8';
+    CX.fillRect(-24, -12, 48, 12);
+    CX.fillStyle = '#cdd8e8';
+    CX.beginPath();
+    CX.ellipse(0, -44, 20, 30, 0, 0, 7); CX.fill();
+    CX.beginPath();
+    CX.moveTo(-18, -44); CX.lineTo(-42, -62); CX.lineTo(-40, -26); CX.closePath(); CX.fill();
+    CX.fillStyle = '#9fb0c6';
+    CX.beginPath(); CX.arc(9, -52, 4, 0, 7); CX.fill();
+    CX.save();
+    CX.globalAlpha = 0.5 + 0.3 * Math.sin(G.t * 2);
+    drawStar(22, -74, 7, GOLD);
+    CX.restore();
+  }
+  CX.restore();
+}
+/* Ornaments are laid out across the tank in purchase order, so every buy is
+   visible immediately. */
+function drawTankDecor() {
+  const owned = AQ.decor || [];
+  if (!owned.length) return;
+  const slots = [0.20, 0.78, 0.42, 0.88, 0.10, 0.60, 0.30, 0.70, 0.50, 0.94, 0.06, 0.84];
+  owned.forEach((id, i) => {
+    const d = decorById(id);
+    if (!d) return;
+    const x = W * slots[i % slots.length];
+    const base = H * d.y;
+    drawOrnament(id, x, base, Math.min(1, W / 420));
+  });
+}
+
+/* ---------- decor shop: the coin sink that grows the tank ---------- */
+function drawDecorShop(dt) {
+  if (!G.decorShop) return;
+  const rowH = 78, gap = 8, pad = 14;
+  const colW = Math.min(W, 460), x0 = (W - colW) / 2 + pad, rw = colW - pad * 2;
+  const viewTop = 116, viewH = H - viewTop - 12;
+  DEC.max = Math.max(0, DECOR.length * (rowH + gap) - gap - viewH + 8);
+  scrStep(DEC, dt);
+  CX.save();
+  CX.fillStyle = 'rgba(6,22,46,0.95)';
+  CX.fillRect(0, 0, W, H);
+  CX.save();
+  CX.beginPath(); CX.rect(0, viewTop, W, viewH); CX.clip();
+  DEC.cards = [];
+  DECOR.forEach((d, i) => {
+    const y = viewTop + i * (rowH + gap) - DEC.scroll;
+    if (y > H || y + rowH < viewTop) return;
+    const owned = ownsDecor(d.id), price = decorPrice(d), afford = G.coins >= price;
+    CX.fillStyle = owned ? 'rgba(93,231,212,0.10)' : 'rgba(255,255,255,0.07)';
+    rr(x0, y, rw, rowH, 16); CX.fill();
+    CX.strokeStyle = owned ? 'rgba(93,231,212,0.55)' : 'rgba(255,255,255,0.13)';
+    CX.lineWidth = owned ? 2 : 1.3;
+    rr(x0, y, rw, rowH, 16); CX.stroke();
+    // preview
+    CX.save();
+    rr(x0 + 6, y + 6, 74, rowH - 12, 12); CX.clip();
+    const pg = CX.createLinearGradient(0, y, 0, y + rowH);
+    pg.addColorStop(0, '#3f9fe0'); pg.addColorStop(1, '#12508f');
+    CX.fillStyle = pg; CX.fillRect(x0 + 6, y + 6, 74, rowH - 12);
+    drawOrnament(d.id, x0 + 43, y + rowH - 12, 0.52);
+    CX.restore();
+    // name + beauty
+    CX.textAlign = 'left';
+    CX.fillStyle = '#ffffff'; CX.font = fnt(800, 15);
+    CX.fillText(d.name, x0 + 92, y + 28);
+    CX.fillStyle = '#5ee7d4'; CX.font = fnt(800, 12);
+    CX.fillText('+' + d.beauty + ' BEAUTY', x0 + 92, y + 48);
+    // buy button / owned tick
+    const bw2 = 84, bx2 = x0 + rw - bw2 - 12, by2 = y + rowH / 2 - 19;
+    if (owned) {
+      CX.fillStyle = 'rgba(93,231,212,0.16)';
+      rr(bx2, by2, bw2, 38, 19); CX.fill();
+      CX.strokeStyle = '#5ee7d4'; CX.lineWidth = 2; CX.lineCap = 'round';
+      CX.beginPath();
+      CX.moveTo(bx2 + 30, by2 + 19); CX.lineTo(bx2 + 38, by2 + 26); CX.lineTo(bx2 + 54, by2 + 11);
+      CX.stroke();
+    } else {
+      CX.globalAlpha = afford ? 1 : 0.45;
+      chunkyCapsule(bx2, by2, bw2, 38, 19, '#7ce75a', '#34b24a', '#166e2c');
+      CX.font = fnt(800, 13);
+      drawCoin(bx2 + 18, by2 + 19, 8);
+      outlinedText(String(price), bx2 + 30, by2 + 24, 13, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)', 'left');
+      CX.globalAlpha = 1;
+      DEC.cards.push({ id: d.id, x: bx2 - 6, y: y, w: bw2 + 18, h: rowH });
+    }
+  });
+  CX.restore();
+  // header
+  const hg = CX.createLinearGradient(0, 0, 0, viewTop);
+  hg.addColorStop(0, 'rgba(6,22,46,1)'); hg.addColorStop(1, 'rgba(6,22,46,0.92)');
+  CX.fillStyle = hg; CX.fillRect(0, 0, W, viewTop);
+  outlinedText('DECORATE', W / 2, 46, 24, '#ffffff', '#ffe9a8', 'rgba(90,50,0,0.9)');
+  const stars = tankStars(), goals = tankGoals(), beau = tankBeauty();
+  const nextGoal = stars < 3 ? goals[stars] : goals[2];
+  CX.fillStyle = 'rgba(255,255,255,0.8)'; CX.font = fnt(700, 12.5); CX.textAlign = 'center';
+  CX.fillText(tankName() + '  ·  ' + beau + ' / ' + nextGoal + ' beauty for star ' + Math.min(3, stars + 1), W / 2, 68);
+  const bw3 = Math.min(W - 90, 230), bx3 = W / 2 - bw3 / 2;
+  const prevGoal = stars === 0 ? 0 : goals[stars - 1];
+  const fr = stars >= 3 ? 1 : Math.max(0, Math.min(1, (beau - prevGoal) / Math.max(1, nextGoal - prevGoal)));
+  CX.fillStyle = 'rgba(255,255,255,0.16)';
+  rr(bx3, 78, bw3, 9, 4.5); CX.fill();
+  CX.fillStyle = stars >= 3 ? GOLD : '#5ee7d4';
+  rr(bx3, 78, Math.max(9, bw3 * fr), 9, 4.5); CX.fill();
+  // wallet
+  const cp2 = { x: W / 2 - 60, y: 94 };
+  drawCoin(cp2.x + 12, cp2.y + 10, 11);
+  CX.fillStyle = '#ffe9a8'; CX.font = fnt(800, 15); CX.textAlign = 'left';
+  CX.fillText(String(Math.round(G.coins)) + ' coins', cp2.x + 28, cp2.y + 15);
+  const cbx2 = (W - colW) / 2 + colW - 28;
+  CX.strokeStyle = 'rgba(255,255,255,0.85)'; CX.lineWidth = 3; CX.lineCap = 'round';
+  CX.beginPath();
+  CX.moveTo(cbx2 - 6, 40); CX.lineTo(cbx2 + 6, 52);
+  CX.moveTo(cbx2 + 6, 40); CX.lineTo(cbx2 - 6, 52);
+  CX.stroke();
+  if (DEC.max > 4) {
+    const tr = viewH - 8, th = Math.max(30, tr * viewH / (viewH + DEC.max));
+    const ty = viewTop + 4 + (tr - th) * (DEC.scroll / DEC.max);
+    CX.fillStyle = 'rgba(255,255,255,0.10)'; rr(W - 8, viewTop + 4, 4, tr, 2); CX.fill();
+    CX.fillStyle = 'rgba(255,255,255,0.42)'; rr(W - 8, ty, 4, th, 2); CX.fill();
+  }
+  CX.restore();
+  G._decBtns = [{ id: 'close', x: cbx2, y: 46, r: 22 }];
+}
+function decorTap(x, y) {
+  for (const b of (G._decBtns || [])) {
+    if (hitRect(b, x, y)) { G.decorShop = false; Aud.click(); return; }
+  }
+  for (const c of DEC.cards) {
+    if (x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) {
+      const d = decorById(c.id);
+      if (d) buyDecor(d);
+      return;
+    }
+  }
+  if (y < 116) return;
+  G.decorShop = false; Aud.click();
+}
+
+/* ---------- tank complete: the payoff, then a fresh tank ---------- */
+function drawTankDone(dt) {
+  if (!G.tankDone) return;
+  G.tankDone.t += dt;
+  const k = easeOutBack(Math.min(1, G.tankDone.t / 0.45));
+  CX.save();
+  CX.fillStyle = 'rgba(6,22,46,0.86)';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 50, 340), ch = 320;
+  const cx0 = W / 2 - cw / 2, cy0 = H * 0.44 - ch / 2;
+  CX.translate(W / 2, H * 0.44); CX.scale(k, k); CX.translate(-W / 2, -H * 0.44);
+  CX.fillStyle = '#fff6ea';
+  rr(cx0, cy0, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = GOLD; CX.shadowBlur = 26;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx0, cy0, cw, ch, 24); CX.stroke();
+  CX.restore();
+  CX.save();
+  rr(cx0, cy0, cw, ch, 24); CX.clip();
+  drawRays(W / 2, cy0 + 120, 130, GOLD, 0.13);
+  CX.restore();
+  drawRibbon(W / 2, cy0 + 4, Math.min(cw * 0.82, 250), 44, 'TANK COMPLETE', 17);
+  for (let i = 0; i < 3; i++) {
+    const sp = Math.min(1, Math.max(0, (G.tankDone.t - 0.3 - i * 0.22) / 0.3));
+    if (sp <= 0) continue;
+    CX.save();
+    CX.translate(W / 2 - 46 + i * 46, cy0 + 108);
+    CX.scale(easeOutBack(sp), easeOutBack(sp));
+    drawStar(0, 0, 21, GOLD);
+    CX.restore();
+  }
+  CX.fillStyle = '#4a2b6b'; CX.font = fnt(800, 19); CX.textAlign = 'center';
+  CX.fillText(G.tankDone.name + ' is perfect!', W / 2, cy0 + 168);
+  CX.fillStyle = '#8a6ab0'; CX.font = fnt(600, 13);
+  CX.fillText('Your fish move to a brand-new tank —', W / 2, cy0 + 192);
+  CX.fillText('a bigger canvas to decorate.', W / 2, cy0 + 210);
+  drawCoin(W / 2 - 46, cy0 + 240, 13);
+  outlinedText('+' + G.tankDone.reward, W / 2 - 6, cy0 + 247, 21, '#fff3cf', '#ffc93c', 'rgba(70,42,0,0.9)', 'left');
+  CX.fillStyle = '#2a9f6a'; CX.font = fnt(700, 12);
+  CX.fillText('+5 fish food', W / 2, cy0 + 268);
+  const bw4 = cw - 90, bx4 = W / 2 - bw4 / 2, by4 = cy0 + ch - 56;
+  chunkyCapsule(bx4, by4, bw4, 46, 23, '#7ce75a', '#34b24a', '#166e2c');
+  outlinedText('NEXT TANK', W / 2, by4 + 30, 16, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+  CX.restore();
+}
+
+function aquariumTap(x, y) {
+  if (G.fishDetail) {
+    const D = G._fdBtns;
+    if (!D) return;
+    for (const b of D.btns) {
+      if (hitRect(b, x, y)) {
+        if (b.id === 'close') { G.fishDetail = null; Aud.click(); }
+        else if (b.id === 'rename') {
+          let nn = null;
+          try { nn = window.prompt('Name your fish', D.fish.name); } catch (e) { nn = null; }
+          if (nn === null || nn === undefined) {
+            if (typeof window.prompt !== 'function') { D.fish.name = PFFish.randomName(); saveAq(); }
+          } else if (String(nn).trim()) {
+            D.fish.name = String(nn).trim().slice(0, 14);
+            saveAq();
+            PFA.track('fish_renamed', {});
+            toast('Named ' + D.fish.name + '!', 1.8);
+            Aud.buy();
+          }
+        }
+        return;
+      }
+    }
+    if (!hitRect(D.card, x, y)) { G.fishDetail = null; Aud.click(); }
+    return;
+  }
+  for (const b of (G._aqBtns || [])) {
+    if (hitRect(b, x, y)) {
+      if (b.id === 'back') { G.aquarium = false; G.fishDetail = null; AquaGL.hide(); Aud.click(); }
+      else if (b.id === 'album') {
+        G.album = true; ALB.scroll = 0; ALB.vel = 0; ALB.drag = null; Aud.buy(); hapt(8);
+        PFA.track('album_open', { seen: AQ.seen.length, species: PFFish.SPECIES.length, fish: AQ.fish.length });
+      }
+      else if (b.id === 'decor') {
+        G.decorShop = true; DEC.scroll = 0; DEC.vel = 0; DEC.drag = null;
+        Aud.buy(); hapt(8);
+        PFA.track('decor_open', { tank: AQ.tank || 0, owned: (AQ.decor || []).length, beauty: tankBeauty() });
+      }
+      else if (b.id === 'feed') {
+        if (!AQ.fish.length) { toast('Complete level 1 to get your first fish!', 2.2); Aud.deny(); return; }
+        if (AQ.food > 0) {
+          AQ.food--; saveAq();
+          FLAKES.push({ x: W * (0.25 + Math.random() * 0.5), y: 92, t: 0 });
+          PFA.track('fish_fed', { left: AQ.food, fish: AQ.fish.length });
+          Aud.pop(); hapt(10);
+        } else { G.shop = true; G.aquarium = false; AquaGL.hide(); PFA.track('shop_open', { source: 'aquarium_food' }); }
+      } else if (b.id === 'foodpill') { G.shop = true; G.aquarium = false; AquaGL.hide(); PFA.track('shop_open', { source: 'aquarium_pill' }); }
+      return;
+    }
+  }
+  // tap a fish for details
+  for (const f of AQ.fish) {
+    const s = SWIM[f.id];
+    if (!s) continue;
+    const r = PFFish.sizePx(f) * 0.75 + 10;
+    if ((x - s.x) ** 2 + (y - s.y) ** 2 <= r * r) { G.fishDetail = f.id; Aud.click(); hapt(8); return; }
+  }
+}
+
+/* ---------- daily gift modal ---------- */
+function drawGift(dt) {
+  if (!G.gift) return;
+  G.giftT += dt;
+  CX.save();
+  CX.fillStyle = 'rgba(40,10,80,0.55)';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 70, 320), ch = 302;
+  const cx = W / 2 - cw / 2, cy = H * 0.44 - ch / 2;
+  const k = easeOutBack(Math.min(1, G.giftT / 0.35));
+  CX.translate(W / 2, H * 0.44); CX.scale(k, k); CX.translate(-W / 2, -H * 0.44);
+  CX.fillStyle = '#fff6ea';
+  rr(cx, cy, cw, ch, 24); CX.fill();
+  CX.save();
+  CX.shadowColor = 'rgba(120,30,220,0.6)'; CX.shadowBlur = 24;
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx, cy, cw, ch, 24); CX.stroke();
+  CX.restore();
+  CX.save();
+  rr(cx, cy, cw, ch, 24); CX.clip();
+  drawRays(W / 2, cy + 118, 118, GOLD, 0.10);
+  CX.restore();
+  drawRibbon(W / 2, cy + 4, Math.min(cw * 0.8, 236), 44, 'DAILY GIFT', 18);
+  // bouncing gift box
+  const gx = W / 2, gy = cy + 112;
+  CX.save();
+  CX.translate(gx, gy + Math.sin(G.t * 3) * 3);
+  CX.fillStyle = '#ff5f7e'; rr(-34, -24, 68, 50, 10); CX.fill();
+  CX.fillStyle = '#d81f4a'; rr(-34, -24, 68, 13, 10); CX.fill();
+  CX.fillStyle = '#ffd93d'; CX.fillRect(-6, -24, 12, 50);
+  CX.fillStyle = '#ffd93d'; rr(-40, -32, 80, 12, 6); CX.fill();
+  CX.fillStyle = '#ffe793';
+  CX.beginPath(); CX.arc(-9, -37, 7, 0, 7); CX.fill();
+  CX.beginPath(); CX.arc(9, -37, 7, 0, 7); CX.fill();
+  CX.restore();
+  drawCoin(gx - 30, gy + 56, 11);
+  outlinedText('+' + G.gift.amount, gx + 8, gy + 64, 24, '#fff3cf', '#ffc93c', 'rgba(70,42,0,0.9)');
+  if (G.gift.streak > 1) {
+    CX.fillStyle = '#6b4d8f'; CX.font = fnt(600, 13); CX.textAlign = 'center';
+    CX.fillText('Day ' + G.gift.streak + ' in a row — bonus coins!', W / 2, gy + 88);
+  }
+  const bw2 = cw - 70, bh2 = 48, bx = W / 2 - bw2 / 2, by = cy + ch - bh2 - 18;
+  const pulse = 1 + Math.sin(G.t * 4) * 0.02;
+  CX.save();
+  CX.translate(W / 2, by + bh2 / 2); CX.scale(pulse, pulse); CX.translate(-W / 2, -(by + bh2 / 2));
+  CX.save();
+  CX.shadowColor = '#3ddc84'; CX.shadowBlur = 14;
+  chunkyCapsule(bx, by, bw2, bh2, 24, '#7ce75a', '#34b24a', '#166e2c');
+  CX.restore();
+  outlinedText('CLAIM', W / 2, by + 31, 17, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+  CX.restore();
+  CX.restore();
+}
+
+/* ---------- background: vivid candy world ---------- */
+const bgDecor = [];
+for (let i = 0; i < 32; i++) bgDecor.push({
+  x: Math.random(), y: Math.random(), r: 1 + Math.random() * 2.6,
+  v: 0.006 + Math.random() * 0.016, tw: Math.random() * 7, star: i % 4 === 0,
+});
+function drawBG(dt) {
+  const g = CX.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#5b2be0');
+  g.addColorStop(0.52, '#8b3cf0');
+  g.addColorStop(1, '#c94fe0');
+  CX.fillStyle = g;
+  CX.fillRect(0, 0, W, H);
+  // soft sky glow
+  const rg = CX.createRadialGradient(W / 2, H * 0.28, 0, W / 2, H * 0.28, H * 0.55);
+  rg.addColorStop(0, 'rgba(255,255,255,0.14)'); rg.addColorStop(1, 'rgba(255,255,255,0)');
+  CX.fillStyle = rg; CX.fillRect(0, 0, W, H);
+  // rolling wave bands at the bottom
+  for (const [amp, yb, al] of [[14, 0.86, 0.10], [20, 0.93, 0.15]]) {
+    CX.fillStyle = 'rgba(45,8,105,' + al + ')';
+    CX.beginPath();
+    CX.moveTo(0, H);
+    for (let x = 0; x <= W + 16; x += 16) {
+      CX.lineTo(x, H * yb + Math.sin(x * 0.018 + G.t * 0.45 + yb * 40) * amp);
+    }
+    CX.lineTo(W, H);
+    CX.closePath(); CX.fill();
+  }
+  // twinkling sparkles + rising bubbles
+  for (const b of bgDecor) {
+    b.y -= b.v * dt * 6;
+    b.tw += dt * 3;
+    if (b.y < -0.03) { b.y = 1.03; b.x = Math.random(); }
+    const a = 0.12 + 0.14 * (1 + Math.sin(b.tw)) * 0.5;
+    CX.fillStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+    if (b.star) {
+      const x = b.x * W, y = b.y * H, r = b.r * 2.4;
+      CX.beginPath();
+      CX.moveTo(x, y - r); CX.quadraticCurveTo(x, y, x + r, y);
+      CX.quadraticCurveTo(x, y, x, y + r);
+      CX.quadraticCurveTo(x, y, x - r, y);
+      CX.quadraticCurveTo(x, y, x, y - r);
+      CX.fill();
+    } else {
+      CX.beginPath(); CX.arc(b.x * W, b.y * H, b.r, 0, 7); CX.fill();
+    }
+  }
+  // gentle vignette
+  const v = CX.createRadialGradient(W / 2, H * 0.45, H * 0.32, W / 2, H * 0.5, H * 0.8);
+  v.addColorStop(0, 'rgba(30,0,70,0)'); v.addColorStop(1, 'rgba(30,0,70,0.30)');
+  CX.fillStyle = v; CX.fillRect(0, 0, W, H);
+}
+
+/* ---------- main loop ---------- */
+let last = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (ts - last) / 1000 || 0.016);
+  last = ts;
+  G.t += dt; G.idleT += dt; G.selT += dt;
+  if (G.lockT > 0) G.lockT -= dt;
+  if (G.denyT > 0) G.denyT -= dt;
+  if (G.pillPulse > 0) G.pillPulse = Math.max(0, G.pillPulse - dt * 4);
+  if (G.starPop > 0) G.starPop = Math.max(0, G.starPop - dt * 1.6);
+  for (let i = 0; i < G.pop.length; i++) G.pop[i] += dt;
+  for (let i = 0; i < G.pulse.length; i++) if (G.pulse[i] > 0) G.pulse[i] = Math.max(0, G.pulse[i] - dt * 5);
+  for (const k in PRESS) if (PRESS[k] > 0) PRESS[k] = Math.max(0, PRESS[k] - dt * 7);
+  // coin counter easing
+  G.coinShown += (G.coins - G.coinShown) * Math.min(1, dt * 10);
+  if (Math.abs(G.coins - G.coinShown) < 0.5) G.coinShown = G.coins;
+  stepAnims(dt);
+  if ((G.phase === 'play' || G.phase === 'menu') && !anims.length && !G.gift && G.lockT <= 0 && G.idleT > 0.5) Foundry.tick();
+  // idle guidance on every level: after a thinking pause the best-move
+  // flask glows softly, then escalates to the full arrow (replaces the old
+  // paid HINT button — guidance is free and never costs the star rating)
+  const guideDelay = G.level <= 3 ? 4 : 8;
+  if (G.phase === 'play' && G.idleT > guideDelay && !G.hint && !G.gift && !anims.length && G.lockT <= 0) {
+    let mv = null;
+    if (!G.deviated && G.solStep < G.solution.length) mv = G.solution[G.solStep];
+    else { const sol = PF.solve(G.state, { maxNodes: 20000, maxDepth: 48 }); if (sol && sol.length) mv = sol[0]; }
+    if (mv) { G.hint = { from: mv[0], to: mv[1], soft: G.level > 3 }; G.hintT = 0; }
+    else {
+      if (!G.stuckHinted) { G.stuckHinted = true; toast('Looks stuck — try UNDO or SHUFFLE', 2.6); }
+      G.idleT = 0;
+    }
+  }
+  let ox = 0, oy = 0;
+  if (G.shake > 0.2) {
+    G.shakeT += dt;
+    const damp = Math.max(0, 1 - G.shakeT * 6);
+    ox = (Math.random() - 0.5) * G.shake * damp;
+    oy = (Math.random() - 0.5) * G.shake * damp;
+    if (damp <= 0) G.shake = 0;
+  }
+  CX.save();
+  CX.translate(ox, oy);
+  if (G.phase === 'signin') {
+    drawBG(dt);
+    drawSignin(dt);
+  } else if (G.aquarium) {
+    updateAquarium(dt);
+    if (AquaGL.on()) {
+      CX.clearRect(0, 0, W, H);
+      AquaGL.render(dt, G.t);
+    } else {
+      drawAquariumScene(dt);
+    }
+    drawAquariumUI(dt);
+    drawAlbum(dt);
+    drawDecorShop(dt);
+    drawFishDetail(dt);        // above the shelves, so a card can open it
+    drawTankDone(dt);          // the celebration owns the screen
+  } else if (G.phase === 'menu') {
+    drawBG(dt);
+    drawMenu(dt);
+    drawGift(dt);      // daily gift greets the session on the home screen
+    drawAccount(dt);
+  } else {
+  drawBG(dt);
+  drawOrderShelf();
+  for (let i = 0; i < G.view.flasks.length; i++) drawFlask(i);
+  drawPouring();
+  drawHint(dt);
+  // rings
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    r.life -= dt * 2.4; r.r += dt * 260;
+    if (r.life <= 0) { rings.splice(i, 1); continue; }
+    CX.globalAlpha = r.life * 0.8;
+    CX.strokeStyle = r.col;
+    CX.lineWidth = 3 * r.life;
+    CX.beginPath(); CX.arc(r.x, r.y, r.r, 0, 7); CX.stroke();
+  }
+  CX.globalAlpha = 1;
+  // particles
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= p.decay * dt;
+    if (p.life <= 0 || p.y > H + 20) { parts.splice(i, 1); continue; }
+    p.vy += p.grav * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    CX.globalAlpha = Math.max(0, Math.min(1, p.life));
+    CX.fillStyle = p.col;
+    if (p.sq) {
+      p.rot += p.vr * dt;
+      CX.save(); CX.translate(p.x, p.y); CX.rotate(p.rot);
+      CX.fillRect(-p.r / 2, -p.r / 2, p.r, p.r * 0.7);
+      CX.restore();
+    } else {
+      CX.beginPath(); CX.arc(p.x, p.y, p.r * Math.max(0.3, p.life), 0, 7); CX.fill();
+    }
+  }
+  CX.globalAlpha = 1;
+  drawArmHighlights();
+  drawHUD(dt);
+  if (G.flash > 0) {
+    CX.fillStyle = 'rgba(255,255,255,' + (G.flash * 0.13).toFixed(3) + ')';
+    CX.fillRect(0, 0, W, H);
+    G.flash = Math.max(0, G.flash - dt * 4);
+  }
+  drawBanner(dt);
+  if (G.phase === 'win') drawWin(dt);
+  drawGift(dt);
+  drawAccount(dt);
+  }
+  drawShop(dt);
+  drawSettings(dt);
+  // flying coins (over win card)
+  const cp = coinPillPos();
+  for (let i = coinFly.length - 1; i >= 0; i--) {
+    const c = coinFly[i];
+    c.t += dt;
+    if (c.t < 0) continue;
+    const k = Math.min(1, c.t / c.dur);
+    const e = k * k * (3 - 2 * k);
+    const x = c.sx + (cp.x + 19 - c.sx) * e;
+    const y = c.sy + (cp.y + 17 - c.sy) * e - Math.sin(k * Math.PI) * 46;
+    drawCoin(x, y, 9);
+    if (k >= 1) { coinFly.splice(i, 1); Aud.coin(); G.pillPulse = 1; }
+  }
+  // floating text
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.life -= dt * 0.9;
+    if (f.life <= 0) { floats.splice(i, 1); continue; }
+    f.y += f.vy * dt;
+    CX.save();
+    CX.globalAlpha = Math.min(1, f.life * 2);
+    if (f.big) {
+      const age = Math.min(1, (1.15 - f.life) * 3.4);
+      const sc = easeOutBack(age);
+      CX.translate(f.x, f.y); CX.scale(sc, sc); CX.translate(-f.x, -f.y);
+      outlinedText(f.text, f.x, f.y, f.size, '#ffffff', f.col);
+    } else {
+      CX.font = fnt(800, f.size);
+      CX.textAlign = 'center';
+      CX.lineWidth = 4; CX.strokeStyle = 'rgba(10,12,26,0.8)';
+      CX.strokeText(f.text, f.x, f.y);
+      CX.fillStyle = f.col;
+      CX.fillText(f.text, f.x, f.y);
+    }
+    CX.restore();
+  }
+  // Toasts sit in the lane between the board and whichever bottom bar is on
+  // screen. A fixed H-132 put them on top of the last flask row on short
+  // phones, so anchor them to the bar that is actually there.
+  const _undo = BTNS.find(b => b.id === 'undo');
+  const _barTop = G.aquarium ? H - 76 : Math.min(_undo ? _undo.y : H - 104, H - 83);
+  for (let i = toasts.length - 1; i >= 0; i--) {
+    const t = toasts[i];
+    t.life -= dt;
+    if (t.life <= 0) { toasts.splice(i, 1); continue; }
+    const a = Math.min(1, t.life / 0.4) * Math.min(1, (t.max - t.life) / 0.25 + 0.2);
+    CX.globalAlpha = a;
+    CX.font = fnt(800, 15);
+    const tw = CX.measureText(t.msg).width + 34;
+    const ty = _barTop - 22 - i * 44;
+    CX.fillStyle = 'rgba(255,255,255,0.97)';
+    rr(W / 2 - tw / 2, ty - 16, tw, 34, 17);
+    CX.fill();
+    CX.strokeStyle = 'rgba(150,90,230,0.35)';
+    CX.stroke();
+    CX.fillStyle = '#6a2fd8';
+    CX.textAlign = 'center';
+    CX.fillText(t.msg, W / 2, ty + 6);
+    CX.globalAlpha = 1;
+  }
+  drawAd(dt);
+  drawConsent(dt);
+  CX.restore();
+}
+
+/* ---------- boot ---------- */
+function initDailyGift() {
+  try {
+    const today = new Date().toDateString();
+    const last = store.get('giftDay', null);
+    if (last === today) return;
+    const yest = new Date(Date.now() - 864e5).toDateString();
+    const streak = last === yest ? (store.get('giftStreak', 1) + 1) : 1;
+    G.gift = { amount: Math.min(ECON.giftBase + ECON.giftPer * (streak - 1), ECON.giftCap), streak };
+    G.giftT = 0;
+  } catch (e) {}
+}
+
+PFAuth.onChange = function (kind) {
+  if (kind === 'signin') {
+    const u = PFAuth.user();
+    PFA.setUser(u && u.id);
+    PFA.track('sign_in', { provider: u && u.provider });
+    toast('Signed in as ' + ((u && u.name) || 'player'), 2.6);
+    if (G.phase === 'signin') enterAfterGate();
+    G.account = false;
+    Aud.win(); hapt(30);
+  } else if (kind === 'signout') {
+    PFA.track('sign_out', {});
+    PFA.setUser(null);
+    toast('Signed out', 1.8);
+  } else if (kind && kind.indexOf('error:') === 0) {
+    toast('Sign-in didn\u2019t finish \u2014 try again', 2.4);
+    Aud.deny();
+  }
+};
+
+CV.style.position = 'relative';
+CV.style.zIndex = '2';
+AquaGL.init({
+  fish: () => AQ.fish,
+  swim: () => SWIM,
+  flakes: () => FLAKES,
+  sizePx: f => PFFish.sizePx(f),
+});
+resize();
+// live-ops remote config: cached copy applies instantly, network refresh follows
+const RC_DEFAULTS = {
+  hintCost: ECON.hintCost, shuffleCost: ECON.shuffleCost, vialCost: ECON.vialCost,
+  pipetteCost: ECON.pipetteCost, catalystCost: ECON.catalystCost,
+  vialMax: ECON.vialMax, giftBase: ECON.giftBase, giftPer: ECON.giftPer,
+  giftCap: ECON.giftCap, adsPerDay: ADS.perDay, adReward: ADS.reward,
+  foodCost: SHOP_FOOD.cost, foodQty: SHOP_FOOD.qty, eggCost: SHOP_EGG.cost,
+  tankStar1: TANKCFG.star1, tankStar2: TANKCFG.star2, tankStar3: TANKCFG.star3,
+  tankMult: TANKCFG.mult, decorPrice: TANKCFG.priceMult,
+};
+function applyRemoteConfig() {
+  ECON.hintCost    = PFRC.num('hint_cost',    RC_DEFAULTS.hintCost,    0, 500);
+  ECON.shuffleCost = PFRC.num('shuffle_cost', RC_DEFAULTS.shuffleCost, 0, 500);
+  ECON.vialCost    = PFRC.num('vial_cost',    RC_DEFAULTS.vialCost,    0, 500);
+  ECON.vialMax     = PFRC.num('vial_max',     RC_DEFAULTS.vialMax,     0, 4);
+  ECON.pipetteCost = PFRC.num('pipette_cost',  RC_DEFAULTS.pipetteCost,  0, 500);
+  ECON.catalystCost= PFRC.num('catalyst_cost', RC_DEFAULTS.catalystCost, 0, 500);
+  ECON.giftBase    = PFRC.num('gift_base',    RC_DEFAULTS.giftBase,    0, 500);
+  ECON.giftPer     = PFRC.num('gift_per',     RC_DEFAULTS.giftPer,     0, 100);
+  ECON.giftCap     = PFRC.num('gift_cap',     RC_DEFAULTS.giftCap,     0, 1000);
+  ADS.perDay       = PFRC.num('ads_per_day',  RC_DEFAULTS.adsPerDay,   0, 50);
+  ADS.reward       = PFRC.num('ad_reward',    RC_DEFAULTS.adReward,    0, 500);
+  SHOP_FOOD.cost   = PFRC.num('food_cost',    RC_DEFAULTS.foodCost,    0, 999);
+  SHOP_FOOD.qty    = PFRC.num('food_qty',     RC_DEFAULTS.foodQty,     1, 50);
+  SHOP_EGG.cost    = PFRC.num('egg_cost',     RC_DEFAULTS.eggCost,     0, 9999);
+  TANKCFG.star1     = PFRC.num('tank_star1',    RC_DEFAULTS.tankStar1, 1, 100000);
+  TANKCFG.star2     = Math.max(TANKCFG.star1, PFRC.num('tank_star2', RC_DEFAULTS.tankStar2, 1, 200000));
+  TANKCFG.star3     = Math.max(TANKCFG.star2, PFRC.num('tank_star3', RC_DEFAULTS.tankStar3, 1, 400000));
+  TANKCFG.mult      = PFRC.num('tank_mult',      RC_DEFAULTS.tankMult,   1, 10);
+  TANKCFG.priceMult = PFRC.num('decor_price_mult', RC_DEFAULTS.decorPrice, 0.1, 10);
+  // fish drop table: one clamped weight per species (blank = built-in rarity)
+  const wmap = {};
+  let anyW = false;
+  for (const sp of PFFish.SPECIES) {
+    const sl = PFFish.slug(sp);
+    const v = PFRC.num('fish_w_' + sl, -1, -1, 1000);
+    if (v >= 0) { wmap[sl] = v; anyW = true; }
+  }
+  FISHCFG.weights = anyW ? wmap : null;
+  // hunger clock, kept monotonic so a bad config can't invert the stages
+  FISHCFG.hungryH  = PFRC.num('fish_hungry_h', 24, 1, 8760);
+  FISHCFG.starveH  = Math.max(FISHCFG.hungryH, PFRC.num('fish_starve_h', 48, 1, 8760));
+  FISHCFG.loseH    = Math.max(FISHCFG.starveH, PFRC.num('fish_lose_h',   72, 2, 8760));
+  FISHCFG.lossOn   = PFRC.flag('fish_loss_enabled', true);
+  const note = String(PFRC.get('notice', '') || '');
+  if (note && store.get('rcNoticeV', -1) !== PFRC.version()) {
+    toast(note.slice(0, 90), 4.5);
+    store.set('rcNoticeV', PFRC.version());
+  }
+}
+PFRC.onApply(applyRemoteConfig);
+PFRC.init(typeof PF_CONFIG !== 'undefined' ? PF_CONFIG : null);
+reapStarved();          // fish that starved while the app was closed
+// analytics builds ask once for consent before anything is tracked
+if (PFA.enabled && PFA.consent() === null) G.consent = true;
+PFAuth.init();
+if (PFAuth.signedIn()) PFA.setUser(PFAuth.user().id);
+PFA.track('session_start', {
+  level: G.level, balance: G.coins, streak: G.streak,
+  signed_in: PFAuth.signedIn() ? 1 : 0,
+});
+loadLevel(G.level, true);
+if (PFAuth.shouldShowGate()) { G.phase = 'signin'; toasts.length = 0; }
+else if (G.level <= 1) {
+  // first install: straight into level 1 — time-to-fun beats a menu
+  // (genre FTUE convention); the main menu greets every later session
+  G.phase = 'play';
+  G.levelStarted = true;
+  PFA.track('level_start', { level: G.level, hard: G.hard ? 1 : 0, par: G.par });
+  levelIntroToasts(1);
+  initDailyGift();
+} else { G.phase = 'menu'; initDailyGift(); }
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
