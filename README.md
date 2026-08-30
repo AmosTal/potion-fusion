@@ -28,3 +28,6 @@ Also on Android — see the [sideload APK][apk].
 This repository is the deployed web build. It is generated from the game
 source by `web/build.sh` in the main project repository; edit the game
 there, not here.
+
+Served by GitHub Pages straight from `main` at `/` (root) — there is no
+build step and no Actions workflow.
