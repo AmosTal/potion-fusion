@@ -72,6 +72,9 @@ const ECON = {
   hintCost: 25, vialCost: 50, shuffleCost: 35, vialMax: 2,   // hintCost: legacy remote-config knob, no UI since v2.7
   pipetteCost: 40, catalystCost: 60,                         // v3.0 powerups
   giftBase: 20, giftPer: 5, giftCap: 40,
+  // v3.3 move budget. movesOn is a live kill switch: flip it off and the
+  // game reverts to the old unlosable behaviour without shipping a build.
+  movesOn: true, moveSlack: 1, extraMoves: 5, extraMovesCost: 60,
 };
 
 /* ---------- persistence ---------- */
@@ -316,9 +319,10 @@ const G = {
   sel: -1, selT: 0,
   undoStack: [],
   undos: 0, restarted: false, hints: 0, vials: 0, shuffles: 0,
-  phase: 'play',                      // play | anim | win
+  phase: 'play',                      // play | anim | win | lost
   lockT: 0,                           // input lock (level intro)
   winT: 0, winData: null,
+  budget: Infinity, moves: 0, bought: 0, loseT: 0,   // v3.3 move budget
   firstFusionSeen: store.get('fusionSeen', false),
   slots: [], pop: [],                 // per-flask spawn time (intro bounce)
   pulse: [],                          // per-flask squash pulse
@@ -386,6 +390,8 @@ function loadLevel(n, quiet) {
   G.arm = null;
   G.phase = 'play'; G.hint = null; G.idleT = 0; G.winData = null;
   G.moves = 0; G.stuckHinted = false;
+  G.budget = ECON.movesOn ? PF.moveBudget(G.par, n, ECON.moveSlack) : Infinity;
+  G.bought = 0;                                  // extra moves bought this level
   G.levelT0 = Date.now();
   // quiet = booting behind a menu: level_start fires when play actually
   // begins; levelStarted keeps a menu-pause resume from double-counting
@@ -539,10 +545,27 @@ function stepAnims(dt) {
     }
     if (!anims.length) {
       if (PF.isWon(G.state)) beginWin();
-      else { G.phase = 'play'; checkDead(); }
+      else { G.phase = 'play'; if (!checkLose()) checkDead(); }
     }
   }
 }
+
+function movesLeft() { return G.budget - G.moves; }
+/* A move is anything that changes the board or rewinds it: pours, undos and
+ * powerups all draw on the same budget. That is what stops undo from being a
+ * free brute-force — rewinding a blunder costs as much as the blunder did. */
+function spendMove() { G.moves++; }
+function outOfMoves() { return G.phase === 'play' && movesLeft() <= 0 && !PF.isWon(G.state); }
+function beginLose() {
+  G.phase = 'lost'; G.loseT = 0;
+  Aud.deny(); hapt(60); shakeIt(5);
+  PFA.track('level_failed', {
+    level: G.level, hard: G.hard ? 1 : 0, reason: 'out_of_moves',
+    par: G.par, budget: G.budget, bought: G.bought,
+    secs: Math.round((Date.now() - G.levelT0) / 1000),
+  });
+}
+function checkLose() { if (outOfMoves()) { beginLose(); return true; } return false; }
 
 function checkDead() {
   if (!PF.materialOk(G.state)) { toast('Not enough potion left — UNDO or RESTART', 3.0); Aud.deny(); return; }
@@ -631,7 +654,7 @@ function tapFlask(i) {
   if (expected && expected[0] === G.sel && expected[1] === i) G.solStep++;
   else G.deviated = true;
   G.undoStack.push(PF.cloneState(st));
-  G.moves++;
+  spendMove();
   const from = G.sel;
   G.sel = -1; G.hint = null; G.idleT = 0;
   G.state = res.state;
@@ -647,7 +670,9 @@ function doUndo() {
   while (G.pop.length < G.view.flasks.length) { G.pop.push(1); G.pulse.push(0); }
   layout();
   G.sel = -1; G.undos++; G.deviated = true; G.hint = null;
+  spendMove();
   Aud.click(); hapt(10);
+  checkLose();
 }
 function doRestart() {
   if (G.phase === 'anim') return;
@@ -698,6 +723,7 @@ function usePower(i) {
   G.state = res.state;
   G.view = PF.cloneState(res.state);
   G.powers++; G.arm = null; G.deviated = true; G.hint = null; G.idleT = 0;
+  spendMove();
   G.pulse[i] = 1;
   PFA.track('power_used', { power: kind, cost: P.cost(), level: G.level,
     color: res.info.color, balance: G.coins });
@@ -714,7 +740,7 @@ function usePower(i) {
   }
   G.flash = Math.max(G.flash, 0.4);
   Aud.pop(); hapt(22);
-  if (PF.isWon(G.state)) beginWin();
+  if (PF.isWon(G.state)) beginWin(); else checkLose();
 }
 function doVial() {
   if (G.phase !== 'play') return;
@@ -923,6 +949,17 @@ function tapAt(x, y) {
   if (G.phase === 'menu') { menuTap(x, y); return; }
   if (G.bannerT > 0.3 && G.phase === 'play') { G.bannerT = 0.3; return; }
   if (G.lockT > 0) return;
+  if (G.phase === 'lost') {
+    if (G.loseT > 0.35) {
+      for (const b of (G._loseBtns || [])) {
+        if (!hitRect(b, x, y)) continue;
+        if (b.id === 'retry') { G._loseBtns = null; doRestart(); }
+        else buyMoves();
+        return;
+      }
+    }
+    return;
+  }
   if (G.phase === 'win') {
     if (G.winT > 0.9) {
       const xb = G._winBtns && G._winBtns.x2;
@@ -1017,6 +1054,7 @@ window.__back = function () {
   if (G.account) { G.account = false; Aud.click(); return 1; }
   if (G.gift && (G.phase === 'menu' || G.phase === 'play')) { claimGift(); return 1; }
   if (G.arm) { G.arm = null; Aud.click(); return 1; }
+  if (G.phase === 'lost') { G._loseBtns = null; doRestart(); return 1; }
   if (G.phase === 'play') { gotoMenu(); return 1; }
   // mid-pour or on the win card: swallow the press instead of letting the
   // same button quit-prompt a half-second after it would have opened the menu
@@ -1534,7 +1572,28 @@ function drawHUD(dt) {
     }
   }
   if (G.streak >= 2) {
-    outlinedText('×' + G.streak + ' STREAK', lp.x + 134, lp.y + 61, 11, '#ffe36a', '#ffb42e', 'rgba(90,50,0,0.9)', 'left');
+    outlinedText('×' + G.streak, lp.x + 120, lp.y + 60, 11, '#ffe36a', '#ffb42e', 'rgba(90,50,0,0.9)', 'left');
+  }
+  // moves remaining — the level's actual stake, so it reads louder than the
+  // level number as it runs down
+  if (isFinite(G.budget)) {
+    const left = Math.max(0, movesLeft());
+    const low = left <= 5, crit = left <= 3;
+    const mp = { x: lp.x + 134, y: lp.y + 50, w: 92, h: 30 };
+    CX.save();
+    if (crit) {
+      const k = 1 + Math.sin(G.t * 9) * 0.05;
+      CX.translate(mp.x + mp.w / 2, mp.y + mp.h / 2); CX.scale(k, k);
+      CX.translate(-(mp.x + mp.w / 2), -(mp.y + mp.h / 2));
+    }
+    if (crit) chunkyCapsule(mp.x, mp.y, mp.w, mp.h, 15, '#ff8091', '#e8355f', '#8f1230');
+    else if (low) chunkyCapsule(mp.x, mp.y, mp.w, mp.h, 15, '#ffd23f', '#ff9f2e', '#a86200');
+    else chunkyCapsule(mp.x, mp.y, mp.w, mp.h, 15, '#ffffff', '#efe8ff', '#b89ae8');
+    const numCol = crit || low ? '#ffffff' : '#7b3ff2';
+    const numEdge = crit ? 'rgba(110,8,40,0.95)' : low ? 'rgba(110,60,0,0.9)' : 'rgba(0,0,0,0)';
+    outlinedText(String(left), mp.x + 26, mp.y + 21, 17, numCol, crit || low ? '#ffe9ef' : '#5b2be0', numEdge);
+    outlinedText('MOVES', mp.x + 60, mp.y + 20, 10, numCol, crit || low ? '#ffe9ef' : '#5b2be0', numEdge);
+    CX.restore();
   }
   CX.restore();
   // coin pill (chunky)
@@ -1898,6 +1957,64 @@ function drawHint(dt) {
   CX.lineTo(bx - Math.cos(angA + 0.45) * 10, by - Math.sin(angA + 0.45) * 10);
   CX.stroke();
   CX.restore();
+}
+
+
+/* ---------- out-of-moves screen ----------
+ * The counterpart to the win card. Two ways out and both are honest: buy the
+ * moves back and keep the board you built, or retry the level from scratch
+ * for free. Retry is never gated, so running dry can cost time but never
+ * progress. */
+function drawLose(dt) {
+  G.loseT += dt;
+  const k = Math.min(1, G.loseT / 0.4);
+  CX.fillStyle = 'rgba(60,8,30,' + 0.6 * k + ')';
+  CX.fillRect(0, 0, W, H);
+  const cw = Math.min(W - 48, 340), ch = 286;
+  const cx = W / 2 - cw / 2, cy = H * 0.46 - ch / 2 + (1 - easeOutBack(k)) * 30;
+  CX.save();
+  CX.globalAlpha = k;
+  CX.fillStyle = '#fff6ea';
+  rr(cx, cy, cw, ch, 26); CX.fill();
+  CX.strokeStyle = 'rgba(255,255,255,0.95)'; CX.lineWidth = 3;
+  rr(cx, cy, cw, ch, 26); CX.stroke();
+  drawRibbon(W / 2, cy + 6, Math.min(cw - 40, 250), 52, 'OUT OF MOVES', 19);
+  outlinedText('So close!', W / 2, cy + 108, 24, '#e8355f', '#ff8091', 'rgba(110,8,40,0.9)');
+  CX.fillStyle = '#8a6ab0'; CX.font = fnt(600, 13); CX.textAlign = 'center';
+  CX.fillText('You used all ' + G.budget + ' moves on this level.', W / 2, cy + 136);
+  CX.fillText('Par is ' + G.par + '.', W / 2, cy + 156);
+
+  const bw = cw - 56, bx = W / 2 - bw / 2, bh = 46;
+  const y1 = cy + 176, y2 = y1 + bh + 12;
+  const cost = ECON.extraMovesCost, afford = G.coins >= cost;
+  CX.globalAlpha = k * (afford ? 1 : 0.55);
+  CX.save();
+  if (afford) { CX.shadowColor = '#3ddc84'; CX.shadowBlur = 14; }
+  chunkyCapsule(bx, y1, bw, bh, 23, '#7ce75a', '#34b24a', '#166e2c');
+  CX.restore();
+  outlinedText('+' + ECON.extraMoves + ' MOVES', W / 2 - 22, y1 + 30, 16, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+  drawCoin(W / 2 + 46, y1 + 24, 11);
+  outlinedText(String(cost), W / 2 + 62, y1 + 30, 15, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)', 'left');
+  CX.globalAlpha = k;
+  chunkyCapsule(bx, y2, bw, bh, 23, '#ffffff', '#efe8ff', '#b89ae8');
+  outlinedText('RETRY  (free)', W / 2, y2 + 30, 15, '#7b3ff2', '#5b2be0', 'rgba(0,0,0,0)');
+  CX.restore();
+  G._loseBtns = [
+    { id: 'buy', x: bx, y: y1, w: bw, h: bh },
+    { id: 'retry', x: bx, y: y2, w: bw, h: bh },
+  ];
+}
+function buyMoves() {
+  if (!spendCoins(ECON.extraMovesCost)) { noCoins(); return; }
+  coinSpendFx(ECON.extraMovesCost);
+  G.budget += ECON.extraMoves;
+  G.bought++;
+  G.phase = 'play';
+  G._loseBtns = null;
+  toast('+' + ECON.extraMoves + ' moves — make them count', 2.0);
+  PFA.track('moves_bought', { level: G.level, cost: ECON.extraMovesCost,
+    added: ECON.extraMoves, times: G.bought, balance: G.coins });
+  Aud.buy(); hapt(25);
 }
 
 /* ---------- win screen ---------- */
@@ -4041,6 +4158,7 @@ function frame(ts) {
   }
   drawBanner(dt);
   if (G.phase === 'win') drawWin(dt);
+  if (G.phase === 'lost') drawLose(dt);
   drawGift(dt);
   drawAccount(dt);
   }
@@ -4161,6 +4279,8 @@ const RC_DEFAULTS = {
   foodCost: SHOP_FOOD.cost, foodQty: SHOP_FOOD.qty, eggCost: SHOP_EGG.cost,
   tankStar1: TANKCFG.star1, tankStar2: TANKCFG.star2, tankStar3: TANKCFG.star3,
   tankMult: TANKCFG.mult, decorPrice: TANKCFG.priceMult,
+  movesOn: ECON.movesOn, moveSlack: ECON.moveSlack,
+  extraMoves: ECON.extraMoves, extraMovesCost: ECON.extraMovesCost,
 };
 function applyRemoteConfig() {
   ECON.hintCost    = PFRC.num('hint_cost',    RC_DEFAULTS.hintCost,    0, 500);
@@ -4169,6 +4289,10 @@ function applyRemoteConfig() {
   ECON.vialMax     = PFRC.num('vial_max',     RC_DEFAULTS.vialMax,     0, 4);
   ECON.pipetteCost = PFRC.num('pipette_cost',  RC_DEFAULTS.pipetteCost,  0, 500);
   ECON.catalystCost= PFRC.num('catalyst_cost', RC_DEFAULTS.catalystCost, 0, 500);
+  ECON.movesOn     = PFRC.num('moves_enabled', RC_DEFAULTS.movesOn ? 1 : 0, 0, 1) === 1;
+  ECON.moveSlack   = PFRC.num('move_slack',    RC_DEFAULTS.moveSlack,    0.3, 4);
+  ECON.extraMoves  = PFRC.num('extra_moves',   RC_DEFAULTS.extraMoves,   1, 30);
+  ECON.extraMovesCost = PFRC.num('extra_moves_cost', RC_DEFAULTS.extraMovesCost, 0, 500);
   ECON.giftBase    = PFRC.num('gift_base',    RC_DEFAULTS.giftBase,    0, 500);
   ECON.giftPer     = PFRC.num('gift_per',     RC_DEFAULTS.giftPer,     0, 100);
   ECON.giftCap     = PFRC.num('gift_cap',     RC_DEFAULTS.giftCap,     0, 1000);

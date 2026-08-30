@@ -590,12 +590,32 @@
     return { state: st, solution: solve(st, { maxNodes: 20000 }), level: n };
   }
 
+
+/* ---------- move budget ----------
+ * Until v3.3 the game had no losing condition: undo was free and unbounded,
+ * so any level could be brute-forced by rewinding. A budget derived from the
+ * level's own solver-verified `par` gives failure a meaning while staying
+ * provably fair — the budget is always strictly greater than the optimal
+ * solution, so every level remains winnable without spending anything.
+ *
+ * Slack tapers from roughly 2.5x par early to about 1.45x by level 40, and
+ * levels 1-3 are effectively unmetered so the tutorial can't be failed.
+ */
+function moveBudget(par, level, slackMult) {
+  const p = Math.max(1, par | 0);
+  if (level <= 3) return p + 20;
+  const t = Math.min(1, (level - 3) / 37);
+  const mult = (0.85 - 0.55 * t) * (slackMult == null ? 1 : slackMult);
+  const flat = Math.round(5 - 2 * t);
+  return p + Math.ceil(p * Math.max(0.1, mult)) + flat;
+}
+
   return {
     CAP, PRIMARIES, MIX, COMPONENTS, NAMES, TERTIARY,
     isPrimary, mixOf, colorActive, flask, cloneState, topRun,
     moveInfo, applyMove, legalMoves, isWon, materialOk,
     pipetteInfo, applyPipette, catalystInfo, applyCatalyst, powerTargets,
-    stateKey, solve, genLevel, mulberry32,
+    stateKey, solve, genLevel, mulberry32, moveBudget,
     usePack, packSize, levelParams, buildCandidate,
     smith: {
       target: smithTarget, makeJob: smithMakeJob, inflate: smithInflate,
