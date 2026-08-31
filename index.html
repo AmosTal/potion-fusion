@@ -90,15 +90,64 @@ const store = {
  * persisted, and clearly badged while on. Analytics is suppressed for the
  * whole session so free purchases and level-hopping never pollute the live
  * economy dashboards. */
-const ADMIN = { on: store.get('admin', false), taps: 0, lastTap: 0 };
+const ADMIN = {
+  on: store.get('admin', false) && Date.now() < store.get('adminUntil', 0),
+  taps: 0, lastTap: 0, busy: false,
+};
 (function () {
   const real = PFA.track;
   PFA.track = function (ev, props) { if (!ADMIN.on) real(ev, props); };
 })();
-function adminToggle() {
-  ADMIN.on = !ADMIN.on;
-  store.set('admin', ADMIN.on);
-  toast(ADMIN.on ? 'Admin mode ON — purchases are free' : 'Admin mode OFF', 2.2);
+function adminOff() {
+  ADMIN.on = false;
+  store.set('admin', false); store.set('adminUntil', 0);
+  toast('Admin mode OFF', 1.8);
+}
+/* The seven taps only open the door; walking through it means signing in
+ * with the ops-console email and password. list_admins() answers null for
+ * any authenticated user who is not on the ops.admins allowlist, so the
+ * game never needs its own credential store, and a pass is remembered for
+ * seven days before it asks again. This is a bar, not a vault — everything
+ * admin mode grants (coins, level) already lives in the player's own
+ * localStorage — but the gesture alone no longer opens anything. */
+function adminLogin() {
+  if (ADMIN.busy) return;
+  const cfg = (typeof PF_CONFIG !== 'undefined' && PF_CONFIG) || {};
+  if (!cfg.supabaseUrl || !cfg.supabaseAnonKey) { toast('No backend configured — admin unavailable', 2.2); return; }
+  let email = null, pass = null;
+  try { email = window.prompt('Console admin email'); } catch (e) {}
+  if (!email) return;
+  try { pass = window.prompt('Console password'); } catch (e) {}
+  if (!pass) return;
+  ADMIN.busy = true;
+  fetch(cfg.supabaseUrl + '/auth/v1/token?grant_type=password', {
+    method: 'POST',
+    headers: { apikey: cfg.supabaseAnonKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: email.trim(), password: pass }),
+  }).then(r => r.json()).then(d => {
+    if (!d || !d.access_token) throw new Error('bad-credentials');
+    return fetch(cfg.supabaseUrl + '/rest/v1/rpc/list_admins', {
+      method: 'POST',
+      headers: { apikey: cfg.supabaseAnonKey, Authorization: 'Bearer ' + d.access_token,
+        'Content-Type': 'application/json' },
+      body: '{}',
+    }).then(r => r.json());
+  }).then(list => {
+    ADMIN.busy = false;
+    if (Array.isArray(list)) {
+      ADMIN.on = true;
+      store.set('admin', true);
+      store.set('adminUntil', Date.now() + 7 * 24 * 3600e3);
+      toast('Admin verified — free purchases, level jump', 2.4);
+    } else {
+      toast('That account is not a console admin', 2.4);
+      Aud.deny();
+    }
+  }).catch(() => {
+    ADMIN.busy = false;
+    toast('Sign-in failed — check email, password and connection', 2.6);
+    Aud.deny();
+  });
 }
 function adminVersionTap() {
   const now = Date.now();
@@ -106,7 +155,7 @@ function adminVersionTap() {
   ADMIN.lastTap = now;
   ADMIN.taps++;
   if (ADMIN.on) return;                      // turning off has its own toggle row
-  if (ADMIN.taps >= 7) { ADMIN.taps = 0; adminToggle(); }
+  if (ADMIN.taps >= 7) { ADMIN.taps = 0; adminLogin(); }
   else if (ADMIN.taps >= 4) toast((7 - ADMIN.taps) + ' more taps for admin mode', 1.2);
 }
 
@@ -2756,7 +2805,7 @@ function settingsTap(x, y) {
       } else if (b.id === 'privacylink') openExternal(PRIVACY_URL);
       else if (b.id === 'account') { G.settings = false; G.account = true; Aud.click(); }
       else if (b.id === 'version') adminVersionTap();
-      else if (b.id === 'adminmode') { adminToggle(); Aud.click(); }
+      else if (b.id === 'adminmode') { adminOff(); Aud.click(); }
       else if (b.id === 'golevel') {
         let v = null;
         try { v = window.prompt('Go to level', String(G.level)); } catch (e) { v = null; }
