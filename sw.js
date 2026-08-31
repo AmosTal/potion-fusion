@@ -1,7 +1,7 @@
 /* Offline cache for the web build. The game ships no runtime downloads, so
  * every asset can be precached on install and served cache-first afterwards;
  * a version bump in CACHE retires the old one. */
-const CACHE = 'potion-fusion-v3.6';
+const CACHE = 'potion-fusion-v3.7';
 const ASSETS = [
   './', './index.html', './font.js', './core.js', './levels.js', './fish.js',
   './pixi.min.js', './aquarium2.js', './config.js', './analytics.js',

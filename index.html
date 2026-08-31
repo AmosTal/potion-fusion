@@ -69,8 +69,10 @@ function fnt(w, s) { return w + ' ' + s + 'px ' + FF; }
  * clears, a hint ~2.5 — matching genre booster-to-payout ratios. */
 const ECON = {
   startCoins: 30, base: 10, perfect: 10, streakPer: 2, streakCap: 10,
-  hintCost: 25, vialCost: 50, shuffleCost: 35, vialMax: 2,   // hintCost: legacy remote-config knob, no UI since v2.7
-  pipetteCost: 40, catalystCost: 60,                         // v3.0 powerups
+  // v3.7 pricing: ordered by real value — shuffle is the weakest effect,
+  // vial (permanent space) the strongest. hintCost: legacy RC knob, no UI.
+  hintCost: 25, vialCost: 65, shuffleCost: 25, vialMax: 2,
+  pipetteCost: 40, catalystCost: 45,                         // v3.0 powerups
   giftBase: 20, giftPer: 5, giftCap: 40,
   // v3.3 move budget. movesOn is a live kill switch: flip it off and the
   // game reverts to the old unlosable behaviour without shipping a build.
@@ -398,7 +400,7 @@ const G = {
   phase: 'play',                      // play | anim | win | lost
   lockT: 0,                           // input lock (level intro)
   winT: 0, winData: null,
-  budget: Infinity, moves: 0, bought: 0, loseT: 0,   // v3.3 move budget
+  budget: Infinity, moves: 0, bought: 0, loseT: 0, adMoves: false,   // v3.3 move budget
   firstFusionSeen: store.get('fusionSeen', false),
   slots: [], pop: [],                 // per-flask spawn time (intro bounce)
   pulse: [],                          // per-flask squash pulse
@@ -468,6 +470,7 @@ function loadLevel(n, quiet) {
   G.moves = 0; G.stuckHinted = false;
   G.budget = ECON.movesOn ? PF.moveBudget(G.par, n, ECON.moveSlack) : Infinity;
   G.bought = 0;                                  // extra moves bought this level
+  G.adMoves = false;                             // the one free-ad continue
   G.levelT0 = Date.now();
   // quiet = booting behind a menu: level_start fires when play actually
   // begins; levelStarted keeps a menu-pause resume from double-counting
@@ -860,9 +863,20 @@ function doShuffle() {
       wi++;
     }
     if (PF.stateKey(cand) === PF.stateKey(G.state)) continue;
-    if (PF.materialOk(cand) && PF.solve(cand, { maxNodes: 30000, maxDepth: 56 })) found = cand;
+    if (!PF.materialOk(cand)) continue;
+    // solvable is not enough since the move budget: the new board's solution
+    // must also fit the moves the player has left, with a little room — a
+    // paid tool must never sell a board that cannot be finished
+    const need = isFinite(G.budget) ? movesLeft() : Infinity;
+    const sol = PF.solve(cand, { maxNodes: 30000, maxDepth: Math.min(56, need) });
+    if (sol && sol.length + 2 <= need) found = cand;
   }
-  if (!found) { toast('No luck — try UNDO instead', 2.0); Aud.deny(); return; }
+  if (!found) {
+    toast(isFinite(G.budget)
+      ? 'No shuffle fits your ' + movesLeft() + ' moves left — UNDO or RESTART'
+      : 'No luck — try UNDO instead', 2.4);
+    Aud.deny(); return;
+  }
   spendCoins(ECON.shuffleCost);
   coinSpendFx(ECON.shuffleCost);
   G.shuffles++;
@@ -1032,6 +1046,17 @@ function tapAt(x, y) {
       for (const b of (G._loseBtns || [])) {
         if (!hitRect(b, x, y)) continue;
         if (b.id === 'retry') { G._loseBtns = null; doRestart(); }
+        else if (b.id === 'ad') {
+          startAd('fail_moves', () => {
+            consumeAd();
+            G.budget += ECON.extraMoves;
+            G.adMoves = true;
+            G.phase = 'play'; G._loseBtns = null;
+            toast('+' + ECON.extraMoves + ' moves — make them count', 2.0);
+            PFA.track('moves_ad', { level: G.level, added: ECON.extraMoves, left: adsLeftToday() });
+            Aud.win(); hapt(30);
+          });
+        }
         else buyMoves();
         return;
       }
@@ -2011,7 +2036,10 @@ function drawArmHighlights() {
 function drawHint(dt) {
   if (!G.hint) return;
   G.hintT += dt;
-  if (G.hint.soft && G.hintT > 3.5) G.hint.soft = false;   // escalate to the arrow
+  // Past level 20 the free guidance stays a soft glow and never becomes the
+  // exact arrow: with a move budget in play, handing out the par line for
+  // free was quietly refunding the challenge (and the reason to buy moves).
+  if (G.hint.soft && G.hintT > 3.5 && G.level <= 20) G.hint.soft = false;
   if (G.hintT > 9) { G.hint = null; G.idleT = 0; return; }
   const A = G.slots[G.hint.from], B = G.slots[G.hint.to];
   if (!A || !B) return;
@@ -2069,7 +2097,8 @@ function drawLose(dt) {
   const k = Math.min(1, G.loseT / 0.4);
   CX.fillStyle = 'rgba(60,8,30,' + 0.6 * k + ')';
   CX.fillRect(0, 0, W, H);
-  const cw = Math.min(W - 48, 340), ch = 286;
+  const adOffer = !G.adMoves && adsLeftToday() > 0;
+  const cw = Math.min(W - 48, 340), ch = adOffer ? 344 : 286;
   const cx = W / 2 - cw / 2, cy = H * 0.46 - ch / 2 + (1 - easeOutBack(k)) * 30;
   CX.save();
   CX.globalAlpha = k;
@@ -2084,34 +2113,58 @@ function drawLose(dt) {
   CX.fillText('Par is ' + G.par + '.', W / 2, cy + 156);
 
   const bw = cw - 56, bx = W / 2 - bw / 2, bh = 46;
-  const y1 = cy + 176, y2 = y1 + bh + 12;
-  const cost = ECON.extraMovesCost, afford = G.coins >= cost;
+  let y = cy + 176;
+  const btns = [];
+  if (adOffer) {
+    // the first continue is free for an ad — the strongest converter there is
+    CX.save();
+    CX.shadowColor = '#3ddc84'; CX.shadowBlur = 14;
+    chunkyCapsule(bx, y, bw, bh, 23, '#7ce75a', '#34b24a', '#166e2c');
+    CX.restore();
+    CX.fillStyle = '#ffffff';
+    CX.beginPath();
+    CX.moveTo(bx + 26, y + 15); CX.lineTo(bx + 26, y + 31); CX.lineTo(bx + 40, y + 23);
+    CX.closePath(); CX.fill();
+    outlinedText('FREE +' + ECON.extraMoves + ' MOVES', W / 2 + 8, y + 25, 15, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
+    CX.fillStyle = 'rgba(232,255,236,0.85)'; CX.font = fnt(700, 9.5); CX.textAlign = 'center';
+    CX.fillText('WATCH AN AD', W / 2 + 8, y + 38);
+    btns.push({ id: 'ad', x: bx, y, w: bw, h: bh });
+    y += bh + 12;
+  }
+  const cost = extraMovesPrice(), afford = G.coins >= cost;
   CX.globalAlpha = k * (afford ? 1 : 0.55);
   CX.save();
-  if (afford) { CX.shadowColor = '#3ddc84'; CX.shadowBlur = 14; }
-  chunkyCapsule(bx, y1, bw, bh, 23, '#7ce75a', '#34b24a', '#166e2c');
+  if (afford && !adOffer) { CX.shadowColor = '#ffd23f'; CX.shadowBlur = 12; }
+  chunkyCapsule(bx, y, bw, bh, 23, '#ffd23f', '#ff9f2e', '#a86200');
   CX.restore();
-  outlinedText('+' + ECON.extraMoves + ' MOVES', W / 2 - 22, y1 + 30, 16, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
-  drawCoin(W / 2 + 46, y1 + 24, 11);
-  outlinedText(String(cost), W / 2 + 62, y1 + 30, 15, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)', 'left');
+  outlinedText('+' + ECON.extraMoves + ' MOVES', W / 2 - 22, y + 30, 16, '#ffffff', '#fff3cf', 'rgba(110,60,0,0.92)');
+  drawCoin(W / 2 + 46, y + 24, 11);
+  outlinedText(String(cost), W / 2 + 62, y + 30, 15, '#ffffff', '#fff3cf', 'rgba(110,60,0,0.92)', 'left');
+  btns.push({ id: 'buy', x: bx, y, w: bw, h: bh });
+  y += bh + 12;
   CX.globalAlpha = k;
-  chunkyCapsule(bx, y2, bw, bh, 23, '#ffffff', '#efe8ff', '#b89ae8');
-  outlinedText('RETRY  (free)', W / 2, y2 + 30, 15, '#7b3ff2', '#5b2be0', 'rgba(0,0,0,0)');
+  chunkyCapsule(bx, y, bw, bh, 23, '#ffffff', '#efe8ff', '#b89ae8');
+  outlinedText('RETRY  (free)', W / 2, y + 30, 15, '#7b3ff2', '#5b2be0', 'rgba(0,0,0,0)');
+  btns.push({ id: 'retry', x: bx, y, w: bw, h: bh });
   CX.restore();
-  G._loseBtns = [
-    { id: 'buy', x: bx, y: y1, w: bw, h: bh },
-    { id: 'retry', x: bx, y: y2, w: bw, h: bh },
-  ];
+  G._loseBtns = btns;
+}
+/* Each repeat purchase in the same level costs 1.5x the last: flat and
+ * unlimited made "keep buying" the optimal strategy at the exact moment the
+ * game is supposed to have stakes. */
+function extraMovesPrice() {
+  return Math.round(ECON.extraMovesCost * Math.pow(1.5, G.bought) / 5) * 5;
 }
 function buyMoves() {
-  if (!spendCoins(ECON.extraMovesCost)) { noCoins(); return; }
-  coinSpendFx(ECON.extraMovesCost);
+  const price = extraMovesPrice();
+  if (!spendCoins(price)) { noCoins(); return; }
+  coinSpendFx(price);
   G.budget += ECON.extraMoves;
   G.bought++;
   G.phase = 'play';
   G._loseBtns = null;
   toast('+' + ECON.extraMoves + ' moves — make them count', 2.0);
-  PFA.track('moves_bought', { level: G.level, cost: ECON.extraMovesCost,
+  PFA.track('moves_bought', { level: G.level, cost: price,
     added: ECON.extraMoves, times: G.bought, balance: G.coins });
   Aud.buy(); hapt(25);
 }
@@ -2527,7 +2580,9 @@ function drawAd(dt) {
     CX.shadowColor = '#3ddc84'; CX.shadowBlur = 16;
     chunkyCapsule(bx, by, bw, 54, 27, '#7ce75a', '#34b24a', '#166e2c');
     CX.restore();
-    outlinedText(G.ad.placement === 'win_x2' ? 'CLAIM  ×2 COINS' : 'CLAIM  +' + ADS.reward,
+    outlinedText(G.ad.placement === 'win_x2' ? 'CLAIM  ×2 COINS'
+      : G.ad.placement === 'fail_moves' ? 'CLAIM  +' + ECON.extraMoves + ' MOVES'
+      : 'CLAIM  +' + ADS.reward,
       W / 2, by + 34, 18, '#ffffff', '#e2ffe6', 'rgba(10,70,26,0.92)');
     btns.push({ id: 'claim', x: bx, y: by, w: bw, h: 54 });
   }
@@ -4279,7 +4334,7 @@ function frame(ts) {
   // idle guidance on every level: after a thinking pause the best-move
   // flask glows softly, then escalates to the full arrow (replaces the old
   // paid HINT button — guidance is free and never costs the star rating)
-  const guideDelay = G.level <= 3 ? 4 : 8;
+  const guideDelay = G.level <= 3 ? 4 : G.level <= 20 ? 8 : 12;
   if (G.phase === 'play' && G.idleT > guideDelay && !G.hint && !G.gift && !anims.length && G.lockT <= 0) {
     let mv = null;
     if (!G.deviated && G.solStep < G.solution.length) mv = G.solution[G.solStep];
