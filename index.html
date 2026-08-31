@@ -1451,6 +1451,16 @@ function drawFlaskBody(f, s, selected, idx) {
     }
     drawGlyph(s.x + s.w / 2, ly + layerH / 2, Math.min(7, layerH * 0.3), GLYPH[c], 0.26);
   }
+  if (f.units.length) {
+    // warm inner glow at the belly — the app-icon look, one cheap radial
+    const gy = s.y + s.h - 2 - layerH * 0.55;
+    const gr = Math.max(8, s.w * 0.42);
+    const glow = CX.createRadialGradient(s.x + s.w / 2, gy, 1, s.x + s.w / 2, gy, gr);
+    glow.addColorStop(0, 'rgba(255,240,180,0.30)');
+    glow.addColorStop(1, 'rgba(255,240,180,0)');
+    CX.fillStyle = glow;
+    CX.fillRect(s.x, gy - gr, s.w, gr * 2);
+  }
   if (f.units.length && !done) {
     for (let b = 0; b < 2; b++) {
       const ph = (G.t * 0.5 + idx * 1.7 + b * 2.3) % 1;
@@ -1458,8 +1468,8 @@ function drawFlaskBody(f, s, selected, idx) {
       const byTop = s.y + s.h - 4 - layerH * f.units.length;
       const by = s.y + s.h - 6 - (s.h - 10) * ph * (f.units.length / CAP);
       if (by > byTop + 4) {
-        CX.fillStyle = 'rgba(255,255,255,0.20)';
-        CX.beginPath(); CX.arc(bx, by, 1.6 + b, 0, 7); CX.fill();
+        CX.fillStyle = 'rgba(255,255,255,0.30)';
+        CX.beginPath(); CX.arc(bx, by, 2 + b, 0, 7); CX.fill();
       }
     }
   }
@@ -3014,18 +3024,107 @@ function drawProviderBtn(id, x, y, w, h, small) {
   }
 }
 
+/* ---------- hero flask (menu / sign-in) ----------
+ * Matches the store icon: a round-bottomed potion flask with a fat white
+ * outline, pink-tinted glass, a glowing orange potion and gold four-point
+ * sparkles over a slow ray burst. The in-level flasks stay lean — this is
+ * the poster shot. */
+function drawSparkle(cx, cy, r, col, rot) {
+  CX.save();
+  CX.translate(cx, cy); CX.rotate(rot || 0);
+  CX.beginPath();
+  CX.moveTo(0, -r);
+  CX.quadraticCurveTo(r * 0.16, -r * 0.16, r, 0);
+  CX.quadraticCurveTo(r * 0.16, r * 0.16, 0, r);
+  CX.quadraticCurveTo(-r * 0.16, r * 0.16, -r, 0);
+  CX.quadraticCurveTo(-r * 0.16, -r * 0.16, 0, -r);
+  CX.closePath();
+  CX.shadowColor = col; CX.shadowBlur = 10;
+  CX.fillStyle = col; CX.fill();
+  CX.restore();
+}
+function drawHeroFlask(cx, fy, fh) {
+  const R = fh * 0.335, neckW = fh * 0.19;
+  const bodyCy = fy + fh - R;
+  const a = Math.asin((neckW / 2) / R);
+  drawRays(cx, bodyCy, fh * 0.92, '#c9a1ff', 0.16);
+  const amb = CX.createRadialGradient(cx, bodyCy, R * 0.2, cx, bodyCy, fh * 0.95);
+  amb.addColorStop(0, 'rgba(200,140,255,0.30)');
+  amb.addColorStop(1, 'rgba(200,140,255,0)');
+  CX.fillStyle = amb;
+  CX.fillRect(cx - fh, bodyCy - fh, fh * 2, fh * 2);
+  CX.fillStyle = 'rgba(30,5,70,0.35)';
+  CX.beginPath(); CX.ellipse(cx, fy + fh + 8, R * 1.05, 9, 0, 0, 7); CX.fill();
+  const flask = () => {
+    CX.beginPath();
+    CX.moveTo(cx - neckW / 2, fy + 4);
+    CX.lineTo(cx - neckW / 2, bodyCy - Math.cos(a) * R);
+    CX.arc(cx, bodyCy, R, -Math.PI / 2 - a, -Math.PI / 2 + a, true);
+    CX.lineTo(cx + neckW / 2, fy + 4);
+    CX.closePath();
+  };
+  flask();
+  const glass = CX.createLinearGradient(cx - R, 0, cx + R, 0);
+  glass.addColorStop(0, 'rgba(255,225,244,0.92)');
+  glass.addColorStop(0.5, 'rgba(255,240,250,0.85)');
+  glass.addColorStop(1, 'rgba(244,205,240,0.92)');
+  CX.fillStyle = glass; CX.fill();
+  CX.save();
+  flask(); CX.clip();
+  const ly = bodyCy - R * 0.30;
+  const liq = CX.createLinearGradient(0, ly, 0, bodyCy + R);
+  liq.addColorStop(0, '#ff9d2e'); liq.addColorStop(1, '#ef6c10');
+  CX.fillStyle = liq;
+  CX.fillRect(cx - R, ly, R * 2, R * 2);
+  const hot = CX.createRadialGradient(cx + R * 0.08, bodyCy + R * 0.28, 2, cx + R * 0.08, bodyCy + R * 0.28, R * 0.78);
+  hot.addColorStop(0, 'rgba(255,224,120,0.95)');
+  hot.addColorStop(1, 'rgba(255,224,120,0)');
+  CX.fillStyle = hot;
+  CX.fillRect(cx - R, ly, R * 2, R * 2);
+  const chord = Math.sqrt(Math.max(0, R * R - (ly - bodyCy) * (ly - bodyCy)));
+  CX.fillStyle = '#d95f0e';
+  CX.beginPath(); CX.ellipse(cx, ly, chord, R * 0.10, 0, 0, 7); CX.fill();
+  CX.fillStyle = 'rgba(255,205,120,0.65)';
+  CX.beginPath(); CX.ellipse(cx, ly - R * 0.02, chord * 0.9, R * 0.05, 0, 0, 7); CX.fill();
+  CX.strokeStyle = 'rgba(255,255,255,0.85)'; CX.lineWidth = 2.5;
+  CX.beginPath(); CX.arc(cx + R * 0.34, bodyCy + R * 0.10, R * 0.14, 0, 7); CX.stroke();
+  CX.fillStyle = 'rgba(255,255,255,0.9)';
+  CX.beginPath(); CX.arc(cx + R * 0.16, bodyCy - R * 0.12, R * 0.05, 0, 7); CX.fill();
+  CX.beginPath(); CX.arc(cx - R * 0.28, bodyCy + R * 0.30, R * 0.045, 0, 7); CX.fill();
+  CX.restore();
+  flask();
+  CX.lineJoin = 'round';
+  CX.strokeStyle = 'rgba(255,255,255,0.97)';
+  CX.lineWidth = Math.max(5, fh * 0.055);
+  CX.stroke();
+  CX.fillStyle = '#ffffff';
+  rr(cx - neckW * 0.95, fy - 4, neckW * 1.9, 11, 5.5); CX.fill();
+  CX.fillStyle = 'rgba(120,60,150,0.30)';
+  rr(cx - neckW * 0.62, fy - 1.5, neckW * 1.24, 5, 2.5); CX.fill();
+  CX.save();
+  CX.globalAlpha = 0.5;
+  CX.fillStyle = '#ffffff';
+  CX.beginPath();
+  CX.ellipse(cx - R * 0.45, bodyCy - R * 0.35, R * 0.16, R * 0.34, -0.5, 0, 7);
+  CX.fill();
+  CX.globalAlpha = 0.35;
+  rr(cx - neckW * 0.32, fy + 10, neckW * 0.24, Math.max(8, bodyCy - Math.cos(a) * R - fy - 6), 3);
+  CX.fill();
+  CX.restore();
+}
+
 function drawTitleBlock() {
   const cx = W / 2;
   const bob = Math.sin(G.t * 2) * 4;
   // The wordmark is a fixed-size stack, so it is placed relative to the flask
   // rather than at a percentage of the screen: on a short phone the old
   // percentages drove "POTION" up into the flask it sits under.
-  const fh = Math.min(112, H * 0.155), fw = fh * 0.75;
+  const fh = Math.min(118, H * 0.16), fw = fh * 0.75;
   const fy = H * 0.10 + bob;
-  drawFlaskBody({ units: ['O', 'O', 'O'], order: null, done: false },
-    { x: cx - fw / 2, y: fy, w: fw, h: fh, kind: 'order' }, false, 0);
-  drawStar(cx + fw * 0.69, fy + fh * 0.09, 11, GOLD);
-  drawStar(cx - fw * 0.76, fy + fh * 0.89, 7, GOLD);
+  drawHeroFlask(cx, fy, fh);
+  drawSparkle(cx + fw * 0.82, fy + fh * 0.10, 11, GOLD, 0.2);
+  drawSparkle(cx - fw * 0.88, fy + fh * 0.34, 7, '#ffe36a', -0.3);
+  drawSparkle(cx + fw * 0.72, fy + fh * 0.80, 5.5, '#ffd23f', 0.5);
   const t0 = Math.max(fy + fh + 44, H * 0.315);
   outlinedText('POTION', cx, t0, 42, '#ffffff', '#efe8ff', 'rgba(60,20,140,0.9)');
   outlinedText('FUSION', cx, t0 + 50, 46, '#ffe36a', '#ffb42e', 'rgba(120,60,0,0.92)');
