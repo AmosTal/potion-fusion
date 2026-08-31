@@ -83,6 +83,33 @@ const store = {
   set(k, v) { try { localStorage.setItem('pf_' + k, JSON.stringify(v)); } catch (e) {} },
 };
 
+/* ---------- admin / dev mode ----------
+ * For the developer's own playtesting: prices stay on screen but nothing is
+ * charged, and settings gains a GO TO LEVEL jump. Hidden behind seven taps
+ * on the version line in settings (the Android developer-options gesture),
+ * persisted, and clearly badged while on. Analytics is suppressed for the
+ * whole session so free purchases and level-hopping never pollute the live
+ * economy dashboards. */
+const ADMIN = { on: store.get('admin', false), taps: 0, lastTap: 0 };
+(function () {
+  const real = PFA.track;
+  PFA.track = function (ev, props) { if (!ADMIN.on) real(ev, props); };
+})();
+function adminToggle() {
+  ADMIN.on = !ADMIN.on;
+  store.set('admin', ADMIN.on);
+  toast(ADMIN.on ? 'Admin mode ON — purchases are free' : 'Admin mode OFF', 2.2);
+}
+function adminVersionTap() {
+  const now = Date.now();
+  if (now - ADMIN.lastTap > 2500) ADMIN.taps = 0;
+  ADMIN.lastTap = now;
+  ADMIN.taps++;
+  if (ADMIN.on) return;                      // turning off has its own toggle row
+  if (ADMIN.taps >= 7) { ADMIN.taps = 0; adminToggle(); }
+  else if (ADMIN.taps >= 4) toast((7 - ADMIN.taps) + ' more taps for admin mode', 1.2);
+}
+
 /* ---------- haptics ---------- */
 function hapt(ms) {
   if (!hapt.on) return;
@@ -610,6 +637,7 @@ function beginWin() {
   if (G.level >= store.get('best', 1)) store.set('best', G.level + 1);
 }
 function spendCoins(n) {
+  if (ADMIN.on) { G.pillPulse = 1; return true; }   // see the price, pay nothing
   if (G.coins < n) return false;
   G.coins -= n; store.set('coins', G.coins);
   G.pillPulse = 1;
@@ -811,7 +839,8 @@ function noCoins() {
 }
 function coinSpendFx(n) {
   const p = coinPillPos();
-  floatText(p.x + p.w / 2, p.y + 34, '-' + n, '#ff8091', 15);
+  if (ADMIN.on) floatText(p.x + p.w / 2, p.y + 34, 'FREE', '#5ee7d4', 15);
+  else floatText(p.x + p.w / 2, p.y + 34, '-' + n, '#ff8091', 15);
 }
 function toggleSound() { Aud.on = !Aud.on; store.set('sound', Aud.on); if (Aud.on) { Aud.ensure(); Aud.click(); } PFA.track('settings_change', { key: 'sound', on: Aud.on ? 1 : 0 }); }
 function toggleMusic() {
@@ -1534,6 +1563,16 @@ function drawBanner(dt) {
   CX.restore();
 }
 
+function drawAdminBadge(cx, cy) {
+  if (!ADMIN.on) return;
+  CX.save();
+  CX.font = fnt(800, 9.5);
+  const tw = CX.measureText('ADMIN').width + 14;
+  chunkyCapsule(cx - tw / 2, cy, tw, 17, 8.5, '#ffd23f', '#ff9f2e', '#a86200');
+  CX.fillStyle = '#5c3400'; CX.textAlign = 'center';
+  CX.fillText('ADMIN', cx, cy + 12);
+  CX.restore();
+}
 /* ---------- HUD ---------- */
 function drawHUD(dt) {
   computeButtons();
@@ -1574,6 +1613,7 @@ function drawHUD(dt) {
   if (G.streak >= 2) {
     outlinedText('×' + G.streak, lp.x + 120, lp.y + 60, 11, '#ffe36a', '#ffb42e', 'rgba(90,50,0,0.9)', 'left');
   }
+  drawAdminBadge((lp.x + lp.w + coinPillPos().x) / 2, 16);
   // moves remaining — the level's actual stake, so it reads louder than the
   // level number as it runs down
   if (isFinite(G.budget)) {
@@ -2641,10 +2681,12 @@ function drawSettings(dt) {
     { id: 'haptics', label: 'VIBRATION', on: hapt.on },
   ];
   if (PFA.enabled) rows.push({ id: 'analytics', label: 'SHARE STATS', sub: 'Anonymous gameplay stats', on: PFA.consent() === 1 });
+  if (ADMIN.on) rows.push({ id: 'adminmode', label: 'ADMIN MODE', sub: 'Free purchases · level jump', on: true });
   const links = [{ id: 'privacylink', label: 'PRIVACY POLICY' }];
+  if (ADMIN.on) links.push({ id: 'golevel', label: 'GO TO LEVEL…' });
   if (PFAuth.available()) links.push({ id: 'account', label: 'ACCOUNT' });
   const cw = Math.min(W - 56, 340);
-  const ch = 62 + rows.length * 54 + 4 + links.length * 44 + 34;
+  const ch = 62 + rows.length * 54 + 4 + links.length * 50 + 40;
   const cx0 = W / 2 - cw / 2;
   const cy0 = Math.max(12, Math.min(H * 0.46 - ch / 2, H - 12 - ch));
   CX.fillStyle = '#fff6ea';
@@ -2691,6 +2733,9 @@ function drawSettings(dt) {
   }
   CX.fillStyle = '#b7a3d6'; CX.font = fnt(600, 11); CX.textAlign = 'center';
   CX.fillText('Potion Fusion v' + VERSION, W / 2, cy0 + ch - 14);
+  // the version line doubles as the hidden admin-mode switch (7 taps); the
+  // rect is invisible but still honours the 44px touch minimum
+  btns.push({ id: 'version', x: W / 2 - 90, y: cy0 + ch - 44, w: 180, h: 44 });
   CX.restore();
   G._setBtns = { card: { x: cx0, y: cy0, w: cw, h: ch }, btns };
 }
@@ -2710,6 +2755,20 @@ function settingsTap(x, y) {
         Aud.click();
       } else if (b.id === 'privacylink') openExternal(PRIVACY_URL);
       else if (b.id === 'account') { G.settings = false; G.account = true; Aud.click(); }
+      else if (b.id === 'version') adminVersionTap();
+      else if (b.id === 'adminmode') { adminToggle(); Aud.click(); }
+      else if (b.id === 'golevel') {
+        let v = null;
+        try { v = window.prompt('Go to level', String(G.level)); } catch (e) { v = null; }
+        const n = Math.floor(Number(v));
+        if (v !== null && isFinite(n) && n >= 1) {
+          G.settings = false;
+          G.level = n; store.set('level', n);
+          loadLevel(n);
+          toast('Level ' + n + ' — par ' + G.par + ', ' + (isFinite(G.budget) ? G.budget + ' moves' : 'no move limit'), 2.4);
+        }
+        Aud.click();
+      }
       return;
     }
   }
@@ -2846,6 +2905,7 @@ function drawMenu(dt) {
   CX.fillStyle = 'rgba(255,255,255,0.45)';
   CX.font = fnt(600, 11);
   CX.fillText('v' + VERSION, cx, H - 12);
+  drawAdminBadge(cx, 14);
   G._menuBtns = btns;
 }
 function menuTap(x, y) {
